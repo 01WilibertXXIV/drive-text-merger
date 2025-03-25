@@ -201,6 +201,7 @@ def process_documents(service, start_time, doc_db):
             if not page_token:
                 break
         
+        
         # Identify deleted files (in our DB but not in active files)
         deleted_files = existing_file_ids - active_file_ids
         for file_id in deleted_files:
