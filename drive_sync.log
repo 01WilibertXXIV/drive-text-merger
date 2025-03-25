@@ -1,0 +1,11 @@
+2025-03-25 15:43:33,220 - INFO - URL provided: https://drive.google.com/drive/u/0/folders/0AFGv_UrBkssJUk9PVA
+2025-03-25 15:43:33,221 - INFO - Parsing URL: https://drive.google.com/drive/u/0/folders/0AFGv_UrBkssJUk9PVA
+2025-03-25 15:43:33,221 - INFO - Matched short folder ID: 0AFGv_UrBkssJUk9PVA
+2025-03-25 15:43:33,225 - INFO - file_cache is only supported with oauth2client<4.0.0
+2025-03-25 15:43:33,229 - INFO - Starting sync from 1970-01-01T00:00:00.000Z
+2025-03-25 15:43:33,229 - INFO - Target folder ID: 0AFGv_UrBkssJUk9PVA
+2025-03-25 15:43:33,229 - INFO - Starting recursive file discovery from folder ID: 0AFGv_UrBkssJUk9PVA
+2025-03-25 15:43:33,230 - INFO - Scanning folder: Root (0AFGv_UrBkssJUk9PVA)
+2025-03-25 15:43:33,770 - INFO - Total files found: 0
+2025-03-25 15:43:33,772 - INFO - Generated 1 merged files: merged_content_20250325_154333_part1.txt
+2025-03-25 15:43:33,772 - INFO - Sync completed. Processed 0 changes, updated 0 files, deleted 0 files.
