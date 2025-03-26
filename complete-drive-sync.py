@@ -15,146 +15,41 @@ import traceback
 import logging
 import time
 import datetime
+import fitz  # PyMuPDF
 
+from helpers.drive_utils import get_name_for_id, parse_drive_url
+from helpers.auth_utils import get_drive_service
+from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
 
 
 # Set up logging
 logging.basicConfig(filename='drive_sync.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Define the scopes for API access - expanded for shared drives
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-
 # Database file to store document metadata and content
+DATA_FOLDER = '.data'
 DOCUMENT_DB = 'document_database.json'
+
 
 start_time = datetime.datetime.now()
 
 SYNCED_CONTENT_FOLDER_NAME = "synced_content"
 
+RESET = "\033[0m"       # Reset color
+BOLD_CYAN = "\033[1;36m"  # Bold Cyan for filenames
+BOLD_YELLOW = "\033[1;33m"  # Bold Yellow for folder names
+MAGENTA = "\033[0;35m"  # Magenta for status updates
+BRIGHT_BLUE = "\033[1;34m"  # Bright Blue for Drive IDs
+RED = "\033[0;31m"  # Red for errors
+GREEN = "\033[0;32m"  # Green for success
+
 
 #region Helper Functions
-
-def get_name_for_id(service, url=None, file_id=None):
-
-    # If URL is provided, parse it to get the ID
-    if url and "my-drive" in url:
-        # This is the root of the user's My Drive
-        target_id = "root"
-    elif file_id:
-        target_id = file_id
-    else:
-        raise ValueError("Either URL or file_id must be provided")
-        
-    # Try as a shared drive first
-    try:
-        drive = service.drives().get(driveId=target_id).execute()
-        return f"Shared Drive - {drive.get('name')}"
-    except:
-        # If that fails, it's a regular folder
-        folder = service.files().get(
-            fileId=target_id,
-            fields='name',
-            supportsAllDrives=True
-        ).execute()
-        return folder.get('name')
-
-def extract_folder_name_from_url(url):
-    """
-    Extract the folder name or ID from a Google Drive URL.
-    
-    Args:
-        url (str): The Google Drive URL containing the folder ID
-    
-    Returns:
-        str: The extracted folder ID
-    """
-    # Regular expression to match different Google Drive URL formats
-    patterns = [
-        r'/folders/([a-zA-Z0-9_-]+)',  # Folder URL pattern
-        r'/drive/folders/([a-zA-Z0-9_-]+)',  # Another folder URL pattern
-        r'id=([a-zA-Z0-9_-]+)'  # ID parameter pattern
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    
-    return None
-
-# Example usage
-
-def parse_drive_url(url):
-    """Extract folder ID, drive ID, or file ID from Google Drive URL."""
-    logging.info(f"Parsing URL: {url}")
-    
-    # Handle shared drive URLs
-    shared_drive_match = re.search(r'drive/folders/([0-9A-Za-z_-]+)', url)
-    if shared_drive_match:
-        drive_id = shared_drive_match.group(1)
-        logging.info(f"Matched folder ID: {drive_id}")
-        return drive_id, "folder"
-    
-    # Handle direct file URLs
-    file_match = re.search(r'drive/d/([0-9A-Za-z_-]+)', url)
-    if file_match:
-        file_id = file_match.group(1)
-        logging.info(f"Matched file ID: {file_id}")
-        return file_id, "file"
-    
-    # Handle shorter URLs
-    short_match = re.search(r'folders/([0-9A-Za-z_-]+)', url)
-    if short_match:
-        folder_id = short_match.group(1)
-        logging.info(f"Matched short folder ID: {folder_id}")
-        return folder_id, "folder"
-    
-    # Handle shared drive root URLs
-    shared_drive_root_match = re.search(r'drive/([0-9A-Za-z_-]+)', url)
-    if shared_drive_root_match:
-        drive_id = shared_drive_root_match.group(1)
-        logging.info(f"Matched shared drive ID: {drive_id}")
-        return drive_id, "drive"
-        
-    # Handle drive root URLs
-    drive_match = re.search(r'drive/u/\d+/my-drive', url)
-    if drive_match:
-        logging.info("Matched root drive")
-        return "root", "folder"  # "root" is a special identifier for the user's My Drive
-    
-    logging.warning(f"No match found for URL: {url}")
-    return None, None
-
-def get_drive_service():
-    """Authenticate and return a Google Drive service object."""
-    creds = None
-    
-    # Load existing credentials if available
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    
-    # Refresh or get new credentials
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # Save credentials for next run
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
-    
-    # Build the service
-    return build('drive', 'v3', credentials=creds)
 
 def get_last_sync_time(output_folder_path):
     """Read the last sync time from a file."""
     try:
-        with open(os.path.join(output_folder_path, 'last_sync.txt'), 'r') as f:
+        with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/last_sync.txt"), 'r') as f:
             return f.read().strip()
     except FileNotFoundError:
         # If it's the first run, use a date far in the past
@@ -162,25 +57,20 @@ def get_last_sync_time(output_folder_path):
 
 def save_last_sync_time(time_str, output_folder_path):
     """Save the current time as the last sync time."""
-    with open(os.path.join(output_folder_path, 'last_sync.txt'), 'w') as f:
+    with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/last_sync.txt"), 'w') as f:
         f.write(time_str)
 
 def load_document_database(output_folder_path):
     """Load the document database from file."""
-    if os.path.exists(os.path.join(output_folder_path, DOCUMENT_DB)):
-        with open(os.path.join(output_folder_path, DOCUMENT_DB), 'r', encoding='utf-8') as f:
+    if os.path.exists(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB}")):
+        with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB}"), 'r', encoding='utf-8') as f:
             return json.load(f)
     return {"documents": {}, "metadata": {"last_updated": ""}}
 
 def save_document_database(db, output_folder_path):
     """Save the document database to file."""
-    with open(os.path.join(output_folder_path, DOCUMENT_DB), 'w', encoding='utf-8') as f:
+    with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB}"), 'w', encoding='utf-8') as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
-
-def extract_text_from_docx(file_data):
-    """Extract text from a Word document."""
-    doc = docx.Document(io.BytesIO(file_data))
-    return "\n".join([paragraph.text for paragraph in doc.paragraphs])
 
 def compute_checksum(text):
     """Compute a checksum for the document text."""
@@ -269,7 +159,7 @@ def get_all_subfolders(service, folder_id, parent_path='', _subfolder_counter=No
 
 
 
-def process_documents(service, start_time, doc_db, target_id=None, target_type=None, output_folder_path=None):
+def process_documents(service, start_time, doc_db, target_id=None, target_type=None, output_folder_path=None, output_folder_name=None):
     """
     Enhanced process_documents to recursively search through all subfolders
     """
@@ -281,17 +171,17 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
     # Track the current time for the next sync point
     current_time = datetime.datetime.now(datetime.UTC).isoformat() + 'Z'
     
-    print("\n=================================================")
+    print()
     if(start_time == "1970-01-01T00:00:00.000Z"):
         print(f"First time running this script, building database from scratch. \nThis may take a while...")
     else:
         logging.info(f"Starting sync from {start_time}")
         print(f"Starting sync from last sync time: {start_time}")
-    print("=================================================\n")
+    print()
 
     if target_id:
         logging.info(f"Target {target_type} ID: {target_id}")
-    
+     
     # Get all docs that have been trashed/deleted since last sync
     existing_file_ids = set(doc_db["documents"].keys())
     active_file_ids = set()
@@ -319,7 +209,6 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
 
             logging.info(f"Searching in folder: {search_folder_id}")
             #print(f"({subfolders_count}/{len(folder_ids_to_search)}) | Searching in folder: {search_folder_id}")
-            subfolders_count += 1
             
             # Construct query for this folder
             query = (
@@ -328,6 +217,8 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                 "mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document') "
                 f"and '{search_folder_id}' in parents"
             )
+
+
             
             page_token = None
             while True:
@@ -344,17 +235,27 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                     list_params['pageToken'] = page_token
                 
                 results = service.files().list(**list_params).execute()
+
+                folder_name = get_name_for_id(service, file_id=search_folder_id)
+
+                terminal_message = f"({subfolders_count}/{len(folder_ids_to_search)}) - Searching in {BOLD_YELLOW}{folder_name}{RESET}"
+                print(terminal_message)
                 
                 items = results.get('files', [])
-                logging.info(f"Found {len(items)} files in this folder")
-                # print(f"Found {len(items)} files in this folder")
+                logging.info(f"Found {len(items)} files in {folder_name}")
 
-                processed_files_count = 1
-                
+                if(len(items) == 0):
+                    print(f"  No files found in this folder")
+                else:
+                    print(f"  Found {len(items)} files")
+
+                processed_files_count = 0
+                files_to_process = len(items)
+
                 for item in items:
                     file_id = item['id']
                     active_file_ids.add(file_id)
-                    
+
                     # Check if this file is new or modified since last sync
                     if (file_id not in doc_db["documents"] or 
                         item['modifiedTime'] > start_time):
@@ -364,9 +265,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             mime_type = item['mimeType']
                             
                             logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
-                            sys.stdout.write('\033[F')  # Move up to file line
-                            sys.stdout.flush()
-                            print(f"Processing folder {subfolders_count} out of {len(folder_ids_to_search)} | Processing file {processed_files_count} out of {len(items)} | {file_name}")
+                            print(f"  ↳ {BOLD_CYAN}{file_name}{RESET}. Processing...  ", end="", flush=True) 
                             
                             # For Google Docs, we need to export as DOCX
                             export_params = {
@@ -385,19 +284,14 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             done = False
                             while not done:
                                 status, done = downloader.next_chunk()
-                                # print(f"Download progress: {int(status.progress() * 100)}%", end='\r', flush=True)
-                                # sys.stdout.write('\033[F')  # Move up to file line
-                                # sys.stdout.flush()
-                                # print(f"({subfolders_count}/{len(folder_ids_to_search)}) | ({processed_files_count}/{len(items)}) | Download progress: {int(status.progress() * 100)}%")
-                        
+                                print(f"\r  ↳ {BOLD_CYAN}{file_name}{RESET} - {int(status.progress() * 100)}%", end="", flush=True)
+                            print(f"\r  ↳ {BOLD_CYAN}{file_name}{RESET} - {GREEN}Updated!{RESET}                 ") 
 
                             # Extract text based on file type
                             if mime_type == 'application/vnd.google-apps.document' or mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
                                 text = extract_text_from_docx(file_data.getvalue())
                             elif mime_type == 'application/pdf':
-                                # For PDFs, you would need a PDF processing library
-                                # This is a placeholder
-                                text = f"PDF content extraction would go here for {file_name}"
+                                text = extract_text_from_pdf(file_data.getvalue())
                             else:
                                 text = f"Unsupported format: {mime_type} for file {file_name}"
                             
@@ -428,11 +322,22 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                         except Exception as e:
                             logging.error(f"Error processing file {file_id}: {str(e)}")
                             logging.error(traceback.format_exc())
-                            print(f"Error processing file: {str(e)}")
+                            # print(f"Error processing file: {str(e)}")
+                            # print(f"Error processing file: {file_name} ({file_id}) - {mime_type}")
+
+                    else:
+                        file_name = item['name']
+                        print(f"  ↳ {BOLD_CYAN}{file_name}{RESET} - No changes detected. Skipping!")
+
+                # if(processed_files_count != files_to_process):
+                #     print(f"  {files_to_process - processed_files_count} files did not require an update.")
+
+                print()   
                 
                 page_token = results.get('nextPageToken')
                 if not page_token:
                     break
+            subfolders_count += 1
         
         # Identify deleted files (in our DB but not in active files)
         # Only do this for the entire drive if no specific target was provided
@@ -462,25 +367,25 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
     save_document_database(doc_db, output_folder_path)
     
     # Generate the merged file with all content
-    generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path)
+    generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path, output_folder_name)
     
     # Update the last sync time
     save_last_sync_time(current_time, output_folder_path)
 
-    duration = datetime.datetime.now() - start_time
-    hours, remainder = divmod(int(duration.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
+    # duration = datetime.datetime.now() - start_time
+    # hours, remainder = divmod(int(duration.total_seconds()), 3600)
+    # minutes, seconds = divmod(remainder, 60)
     
     logging.info(f"Sync completed. Processed {changes_processed} changes, updated {files_updated} files, deleted {files_deleted} files.")
-    logging.info(f"Total operation time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+    # logging.info(f"Total operation time: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
     print(f"Sync completed. Processed {changes_processed} changes, updated {files_updated} files, deleted {files_deleted} files.")
-    print(f"Total operation time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+    # print(f"Total operation time: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
     return doc_db
 
 
-def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output_folder_path=None):
+def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output_folder_path=None, output_folder_name=None):
     """
     Generate merged files with all active documents, limiting each file to 200MB OR 450,000 words,
     whichever comes first.
@@ -520,12 +425,18 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
     header_word_count = len(header.split())
     
     # Create the first file in the specified output folder path
-    current_file_path = os.path.join(output_folder_path, f"{timestamp_str}_documents_part{file_index}.txt")
+    current_file_path = os.path.join(output_folder_path, f"{timestamp_str}_{output_folder_name}_part{file_index}.txt")
     current_file = open(current_file_path, 'w', encoding='utf-8')
     current_file.write(header)
     current_file_size = len(header.encode('utf-8'))
     current_word_count = header_word_count
     generated_files.append(current_file_path)
+
+    print()
+    print("\n" + "="*50)
+    print(f"{GREEN}✅ Merging Completed!{RESET}")
+    print(f"{BOLD_YELLOW}📁 Output Folder:{RESET} {output_folder_path}")
+    print(f"📂 {len(generated_files)} merged files created: ")
     
     # Write all active documents
     for file_id, doc_info in doc_db["documents"].items():
@@ -544,6 +455,8 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
         doc_word_count = len(doc_content.split())
         doc_header_word_count = len(doc_header.split())
         total_doc_word_count = doc_word_count + doc_header_word_count
+
+        document_part_name = f"{timestamp_str}_documents_part{file_index}.txt"
         
         # Check if adding this document would exceed either limit
         if (current_file_size + doc_size > MAX_FILE_SIZE or 
@@ -562,7 +475,7 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
             
             # Create a new file
             file_index += 1
-            current_file_path = os.path.join(output_folder_path, f"{timestamp_str}_documents_part{file_index}.txt")
+            current_file_path = os.path.join(output_folder_path, document_part_name)
             current_file = open(current_file_path, 'w', encoding='utf-8')
             
             # Write header to the new file
@@ -583,16 +496,17 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
         current_word_count += total_doc_word_count
         
         # Log progress periodically
-        if file_id == list(doc_db["documents"].keys())[-1] or file_id == list(doc_db["documents"].keys())[0]:
+        if file_id == list(doc_db["documents"].keys())[-1]:
             logging.info(f"Current file: {current_file_path}, Size: {current_file_size / (1024 * 1024):.2f}MB, Words: {current_word_count}")
-            print(f"Current file: {current_file_path}, Size: {current_file_size / (1024 * 1024):.2f}MB, Words: {current_word_count}")
+            print(f" ↳ {document_part_name}")
+            print(f"   Size: {current_file_size / (1024 * 1024):.2f}MB")
+            print(f"   Words: {current_word_count}")
     
     # Close the last file
     current_file.close()
     
     logging.info(f"Generated {len(generated_files)} merged files: {', '.join(generated_files)}")
-    print(f"Generated {len(generated_files)} merged files: {', '.join(generated_files)}")
-    print(f"Output folder: {output_folder_path}")
+    print("="*50 + "\n")
 
     return generated_files
 
@@ -633,9 +547,11 @@ def main():
 
             # Create the output folder
             output_folder_path = os.path.join(os.getcwd(), SYNCED_CONTENT_FOLDER_NAME, output_folder_name)
+            
             logging.info(f"Creating output folder: {output_folder_path}")
             print(f"Folder successfully created on computer\n")
             os.makedirs(output_folder_path, exist_ok=True)
+            os.makedirs(f"{output_folder_path}/{DATA_FOLDER}", exist_ok=True)
             
             if not target_id:
                 logging.error(f"Could not parse Drive URL: {url}")
@@ -653,7 +569,7 @@ def main():
             doc_db = load_document_database(output_folder_path)
             
             # Process documents and update the database
-            doc_db = process_documents(service, last_sync_time, doc_db, target_id, target_type, output_folder_path=output_folder_path)
+            doc_db = process_documents(service, last_sync_time, doc_db, target_id, target_type, output_folder_path=output_folder_path, output_folder_name=output_folder_name)
             
         else :
 
@@ -668,7 +584,7 @@ def main():
             doc_db = load_document_database(output_folder_path)
             
             # Process documents and update the database
-            doc_db = process_documents(service, last_sync_time, doc_db, output_folder_path=output_folder_path)
+            doc_db = process_documents(service, last_sync_time, doc_db, output_folder_path=output_folder_path, output_folder_name=output_folder_name)
             
 
         # Here you would add code to feed the output_file into your AI system
