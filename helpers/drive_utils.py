@@ -3,6 +3,10 @@ from googleapiclient.errors import HttpError
 import logging
 
 
+INVALID_CHARS = {
+        '/': '', '\\': '', ':': '', '*': '', '?': '', '"': '', '<': '', '>': '', '|': '', '.': '_'
+    }
+
 def get_name_for_id(service, url=None, file_id=None):
     """Retrieve the name of a Google Drive folder or shared drive."""
     if url and "my-drive" in url:
@@ -14,10 +18,16 @@ def get_name_for_id(service, url=None, file_id=None):
 
     try:
         drive = service.drives().get(driveId=target_id).execute()
-        return f"Shared Drive - {drive.get('name')}"
+        name = drive.get('name')
+        trans_table = str.maketrans(INVALID_CHARS)
+        sanitized_name = name.translate(trans_table)
+        return f"Shared Drive - {sanitized_name}"
     except HttpError:
         folder = service.files().get(fileId=target_id, fields='name', supportsAllDrives=True).execute()
-        return folder.get('name')
+        name = folder.get('name')
+        trans_table = str.maketrans(INVALID_CHARS)
+        sanitized_name = name.translate(trans_table)
+        return sanitized_name
     
 def parse_drive_url(url):
     """Extract folder ID, drive ID, or file ID from Google Drive URL."""

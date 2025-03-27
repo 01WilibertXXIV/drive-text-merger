@@ -16,12 +16,12 @@ pip install -r requirements.txt
 
 ## Usage
 ```bash
-python complete-drive-sync.py "COMPLETE_GOOGLE_DRIVE_URL"
+python merge.py "COMPLETE_GOOGLE_DRIVE_URL"
 ```
 
 ## Example
 ```bash
-python complete-drive-sync.py "https://drive.google.com/drive/folders/1234567890"
+python merge.py "https://drive.google.com/drive/folders/1234567890"
 ```
 
 ## Output
