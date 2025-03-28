@@ -33,6 +33,18 @@ def parse_drive_url(url):
     """Extract folder ID, drive ID, or file ID from Google Drive URL."""
     logging.info(f"Parsing URL: {url}")
     
+    # Handle personal drive root URLs (multiple variants)
+    personal_drive_patterns = [
+        r'drive/u/\d+/my-drive',  # Standard personal drive format with user number
+        r'drive/my-drive',        # Alternative personal drive format
+        r'drive/home'             # Home view of personal drive
+    ]
+    
+    for pattern in personal_drive_patterns:
+        if re.search(pattern, url):
+            logging.info(f"Matched personal drive with pattern: {pattern}")
+            return "root", "folder"  # "root" is a special identifier for the user's My Drive
+    
     # Handle shared drive URLs
     shared_drive_match = re.search(r'drive/folders/([0-9A-Za-z_-]+)', url)
     if shared_drive_match:
@@ -56,16 +68,17 @@ def parse_drive_url(url):
     
     # Handle shared drive root URLs
     shared_drive_root_match = re.search(r'drive/([0-9A-Za-z_-]+)', url)
-    if shared_drive_root_match:
+    if shared_drive_root_match and not any(re.search(p, url) for p in personal_drive_patterns):
         drive_id = shared_drive_root_match.group(1)
         logging.info(f"Matched shared drive ID: {drive_id}")
         return drive_id, "drive"
-        
-    # Handle drive root URLs
-    drive_match = re.search(r'drive/u/\d+/my-drive', url)
-    if drive_match:
-        logging.info("Matched root drive")
-        return "root", "folder"  # "root" is a special identifier for the user's My Drive
+    
+    # Final attempt for direct links with file IDs
+    id_match = re.search(r'id=([0-9A-Za-z_-]+)', url)
+    if id_match:
+        item_id = id_match.group(1)
+        logging.info(f"Matched ID parameter: {item_id}")
+        return item_id, "item"  # Generic "item" type, will need to be determined later
     
     logging.warning(f"No match found for URL: {url}")
     return None, None

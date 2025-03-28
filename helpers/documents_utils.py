@@ -18,6 +18,7 @@ from constants.time_data import START_TIME, START_TIME_STRING
 from helpers.drive_utils import get_name_for_id
 from helpers.sync_utils import save_last_sync_time, compute_checksum
 from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
+from helpers.messages.outro import print_outro
 
 # Set up logging
 logging.basicConfig(filename='drive_sync.log', level=logging.INFO,
@@ -45,6 +46,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
     changes_processed = 0
     files_updated = 0
     files_deleted = 0
+    total_download_bandwidth = 0
     
     # Track the current time for the next sync point
     current_time = datetime.datetime.now(datetime.UTC).isoformat() + 'Z'
@@ -199,11 +201,17 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             file_data = io.BytesIO()
                             downloader = MediaIoBaseDownload(file_data, request)
                             done = False
+
                             while not done:
                                 status, done = downloader.next_chunk()
                                 print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {int(status.progress() * 100)}%                            ", end="", flush=True)
                             print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated!{RESET}                                       ") 
 
+                            # Add downloaded bytes to total bandwidth
+                            file_data_size = len(file_data.getvalue())
+                            total_download_bandwidth += file_data_size
+                            logging.info(f"Downloaded {file_data_size} bytes for {file_name}")
+                            
                             elapsed_time = time.time() - START_TIME
                             progress_percentage = (subfolders_count / len(folder_ids_to_search)) * 100
 
@@ -316,7 +324,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
     save_document_database(doc_db, output_folder_path)
     
     # Generate the merged file with all content
-    generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path, output_folder_name)
+    generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path, output_folder_name, total_download_bandwidth)
     
     # Update the last sync time
     save_last_sync_time(current_time, output_folder_path)
@@ -335,7 +343,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
 
 
 #region Generate Merged File
-def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output_folder_path=None, output_folder_name=None):
+def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output_folder_path=None, output_folder_name=None, total_download_bandwidth=0):
     """
     Generate merged files with all active documents, limiting each file to 200MB OR 400,000 words,
     whichever comes first.
@@ -465,33 +473,7 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
     logging.info(f"Generated {len(generated_files)} merged files: {', '.join(generated_files)}")
     
 
-    print()
-    print("="*50)
-    print(f"{GREEN}✅ Merge Completed!{RESET}")
-    print(f"📁 Output Folder:{RESET} {output_folder_path}{RESET}")
-    print(f"📋 Detailed File Report:{RESET}")
-    for file_path, size in file_sizes.items():
-        file_name = os.path.basename(file_path)
-        size_mb = size / (1024 * 1024)
-        word_count = file_word_counts[file_path]
-        logging.info(f"File: {file_name}, Size: {size_mb:.2f}MB, Words: {word_count:,}")
-        print(f"  • {file_name}{RESET} | {size_mb:.2f}MB | {word_count:,} words")
-    
-    # Log total size and word count of all files
-    total_size_mb = total_size / (1024 * 1024)
-    logging.info(f"Total size of all generated files: {total_size_mb:.2f}MB")
-    logging.info(f"Total word count of all generated files: {total_word_count:,}")
-    print(f"\n📊 Total size:{RESET} {total_size_mb:.2f}MB")
-    print(f"📝 Total words:{RESET} {total_word_count:,}")
-    print()
-    print(f"🕑 Total time taken: {hours:02d}:{minutes:02d}:{seconds:02d}")
-    print("="*50 + "\n")
-
-    print(f"{YELLOW}Thank you for using the {APP_NAME}!{RESET}")
-    print(f"\nDeveloped for the {DARK_GRAY}ArtIA experimental project{RESET} to help make sense")
-    print("of the AI knowledge landscape by organizing and merging documents.")
-    print("Made with ❤️ by @WilibertXXIV") #add collaborators here
-    print("="*50 + "\n")
+    print_outro(output_folder_path, file_sizes, file_word_counts, total_size, total_word_count, hours, minutes, seconds, total_download_bandwidth)
 
     return generated_files
 #endregion
