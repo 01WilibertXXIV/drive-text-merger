@@ -2,6 +2,7 @@ from constants.colors import GREEN, RESET, YELLOW, DARK_GRAY
 from constants.app_data import APP_NAME
 import os
 import logging
+import subprocess
 
 def print_outro(output_folder_path, file_sizes, file_word_counts, total_size, total_word_count, hours, minutes, seconds, download_bandwidth):
 
@@ -98,5 +99,7 @@ def print_outro(output_folder_path, file_sizes, file_word_counts, total_size, to
     print(f"{YELLOW}Thank you for using the {APP_NAME}!{RESET}")
     print(f"\nDeveloped for the {DARK_GRAY}ArtIA experimental project{RESET} to help make sense")
     print("of the AI knowledge landscape by organizing and merging documents.")
+    print()
     print("Made with ❤️ by @WilibertXXIV") #add collaborators here
     print("="*50 + "\n")
+

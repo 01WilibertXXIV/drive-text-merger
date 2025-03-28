@@ -574,7 +574,7 @@ def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, thr
                 
             # Build status message
             queue_size = folder_queue.qsize()
-            status = f"\rFolders: {BOLD_CYAN}{count}{RESET} | Speed: {scan_speed:.1f}/s | Errors: {errors} | "
+            status = f"\rFolders: {BOLD_CYAN}{count + 1}{RESET} | Speed: {scan_speed:.1f}/s | Errors: {errors} | "
             status += f"Time: {hours:02d}:{minutes:02d}:{seconds:02d} | Queue: {queue_size} | Delay: {delay:.3f}s"
             
             # Add no-progress indicator if we've been stuck

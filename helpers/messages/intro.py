@@ -1,4 +1,5 @@
-from constants.colors import BOLD_CYAN, RESET, YELLOW, RED
+import subprocess
+from constants.colors import BOLD_CYAN, RESET, YELLOW, RED, DARK_GRAY
 from constants.app_data import APP_NAME, SYNCED_CONTENT_FOLDER
 
 def print_intro():
@@ -11,6 +12,9 @@ def print_intro():
     print("\n\n")
     print("="*50)
     print(f"{BOLD_CYAN}{APP_NAME}{RESET}")
+    
+    last_updated = get_last_commit_time()
+    print(f"{DARK_GRAY}Last updated: {last_updated}{RESET}")
     print("="*50)
     print("")
     print(f"{YELLOW}📋 PURPOSE:{RESET}")
@@ -26,4 +30,14 @@ def print_intro():
     print("• Do not rename these folders after creation")
     print("• Renaming will break the sync relationship and require starting over")
     print("="*50)
+
+def get_last_commit_time():
+    try:
+        commit_time = subprocess.check_output(
+            ["git", "log", "-1", "--format=%cd", "--date=iso"],
+            text=True
+        ).strip()
+        return commit_time
+    except subprocess.CalledProcessError:
+        return "Unknown (not a Git repository)"
 
