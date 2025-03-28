@@ -4,7 +4,7 @@ import traceback
 import logging
 import argparse
 from updater import is_update_available, update_application, restart_application    
-
+from helpers.init import init
 from helpers.drive_utils import get_name_for_id, parse_drive_url
 from helpers.auth_utils import get_drive_service
 from helpers.sync_utils import get_last_sync_time
@@ -110,6 +110,8 @@ def main():
         print("See log for details.")
 
 if __name__ == '__main__':
+
+    init()
 
     args = parse_arguments()
     is_git_repo = os.path.exists(".git")
