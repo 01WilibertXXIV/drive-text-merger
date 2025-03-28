@@ -204,9 +204,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                         try:
                             file_name = item['name']
                             mime_type = item['mimeType']
-                            
-                            logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
-                            print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True) 
+                        
                             
                             # For Google Docs, we need to export as DOCX
                             export_params = {
@@ -223,6 +221,9 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             file_data = io.BytesIO()
                             downloader = MediaIoBaseDownload(file_data, request)
                             done = False
+
+                            logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
+                            print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True) 
 
                             while not done:
                                 status, done = downloader.next_chunk()

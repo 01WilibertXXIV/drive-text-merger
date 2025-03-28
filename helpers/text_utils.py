@@ -32,6 +32,8 @@ def extract_text_from_pdf(pdf_bytes: Union[bytes, io.BytesIO], file_url: Optiona
     except:
         pass
 
+    metadata_lines.append(f"## END METADATA ##")
+
     # Try each method in sequence
     for method in extraction_methods:
         try:

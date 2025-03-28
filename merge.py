@@ -2,16 +2,25 @@ import os
 import sys
 import traceback
 import logging
+import argparse
+from updater import is_update_available, update_application, restart_application    
 
 from helpers.drive_utils import get_name_for_id, parse_drive_url
 from helpers.auth_utils import get_drive_service
 from helpers.sync_utils import get_last_sync_time
 from helpers.documents_utils import load_document_database, process_documents
 from helpers.messages.intro import print_intro
-from constants.colors import RED, RESET, YELLOW, BOLD_CYAN, DARK_GRAY
 
+from constants.colors import RED, RESET, YELLOW, BOLD_CYAN, DARK_GRAY
 from constants.app_data import DATA_FOLDER, SYNCED_CONTENT_FOLDER
 
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Your application description")
+    parser.add_argument("--no-update", action="store_true", 
+                        help="Skip update check and run the application directly")
+    return parser.parse_args()
 
 def main():
     """
@@ -101,6 +110,30 @@ def main():
         print("See log for details.")
 
 if __name__ == '__main__':
+
+    args = parse_arguments()
+    is_git_repo = os.path.exists(".git")
+
+    # Check for updates unless --no-update flag is provided
+    if not args.no_update and not is_git_repo:
+        try:
+            update_info = is_update_available()
+            if update_info:
+                print(f"Update available: {update_info.get('commit_message', 'No message')}")
+                update_choice = input("Do you want to update now? (y/n): ").strip().lower()
+                
+                if update_choice == 'y':
+                    if update_application():
+                        restart_application()
+                        # This point will not be reached due to restart
+                else:
+                    print("Update skipped. Continuing with current version.")
+            else:
+                print("Your application is up to date.")
+        except Exception as e:
+            print(f"Error checking for updates: {e}")
+            print("Continuing with current version...")
+
     try:
         main()
     except KeyboardInterrupt:

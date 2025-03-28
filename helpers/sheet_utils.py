@@ -41,9 +41,12 @@ def extract_complete_sheet_text(file_data, file_name=None, file_url=None):
                 # Try with xlrd for older Excel files
                 return process_complete_xls_with_xlrd(file_obj, file_name, file_url)
             except ImportError:
+
+
+
                 # If no Excel libraries are available, return helpful error
                 return ("Unable to process Excel file: required libraries not installed. "
-                        "Please install with: pip install pandas openpyxl xlrd")
+                        "Please install with: pip install pandas openpyxl xlrd \n ## END METADATA ##")
     
     except Exception as e:
         error_details = traceback.format_exc()
@@ -109,7 +112,7 @@ def extract_complete_sheet_with_pandas(file_data, file_name=None, file_url=None)
             metadata.append(f"Numeric columns: {'; '.join(numeric_stats)}")
     
     # Add metadata section to output
-    output_parts.append("## METADATA ##")
+
     output_parts.append("\n".join(metadata))
     output_parts.append("## END METADATA ##")
     
