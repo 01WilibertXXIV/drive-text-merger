@@ -19,6 +19,7 @@ from constants.time_data import START_TIME, START_TIME_STRING
 from helpers.drive_utils import get_name_for_id
 from helpers.sync_utils import save_last_sync_time, compute_checksum
 from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
+from helpers.sheet_utils import extract_complete_sheet_text
 from helpers.messages.outro import print_outro
 
 # Set up logging
@@ -150,7 +151,10 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
             query = (
                 "(mimeType='application/vnd.google-apps.document' OR "
                 "mimeType='application/pdf' OR "
-                "mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document') "
+                "mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' OR "
+                "mimeType='application/vnd.google-apps.spreadsheet' OR "
+                "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' OR "
+                "mimeType='text/csv') "
                 "and not name contains '.docm' "
                 f"and '{search_folder_id}' in parents"
             )
@@ -162,7 +166,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                 list_params = {
                     'q': query,
                     'pageSize': 100,
-                    'fields': "nextPageToken, files(id, name, mimeType, modifiedTime, createdTime)",
+                    'fields': "nextPageToken, files(id, name, mimeType, modifiedTime, createdTime, webViewLink)",
                     'spaces': 'drive',
                     'supportsAllDrives': True,
                     'includeItemsFromAllDrives': True
@@ -202,7 +206,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             mime_type = item['mimeType']
                             
                             logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
-                            print(f"  ↳ {YELLOW}{file_name}{RESET}. Processing...                                      ", end="", flush=True) 
+                            print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True) 
                             
                             # For Google Docs, we need to export as DOCX
                             export_params = {
@@ -239,11 +243,21 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
 
                             # print(f'\r[{bar}] {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s', end='\r', flush=True)
 
+                            file_url = item.get("webViewLink", "N/A")
+
                             # Extract text based on file type
                             if mime_type == 'application/vnd.google-apps.document' or mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                                text = extract_text_from_docx(file_data.getvalue())
+                                text = extract_text_from_docx(file_data.getvalue(), file_url)
                             elif mime_type == 'application/pdf':
-                                text = extract_text_from_pdf(file_data.getvalue())
+                                text = extract_text_from_pdf(file_data.getvalue(), file_url)
+                            elif mime_type in [
+                                'application/vnd.google-apps.spreadsheet',
+                                'application/vnd.ms-excel',
+                                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                                'text/csv',
+                                'application/csv'
+                            ]:
+                                text = extract_complete_sheet_text(file_data.getvalue(), file_name, file_url)
                             else:
                                 text = f"Unsupported format: {mime_type} for file {file_name}"
                             
@@ -257,6 +271,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                                 # Store the document in our database
                                 doc_db["documents"][file_id] = {
                                     "name": file_name,
+                                    "url": item.get("webViewLink", "N/A"),
                                     "mimeType": mime_type,
                                     "modifiedTime": item['modifiedTime'],
                                     "createdTime": item['createdTime'],
@@ -268,6 +283,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             else:
                                 # Just update the lastSynced time
                                 doc_db["documents"][file_id]["lastSynced"] = current_time
+                                doc_db["documents"][file_id]["url"] = item.get("webViewLink", "N/A")
 
                             processed_files_count += 1
                          
@@ -387,15 +403,12 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
     minutes, seconds = divmod(remainder, 60)
     
     # Prepare header content
-    header = "=" * 50 + "\n"
-    header += f"Sync Completed - Generated on {timestamp}\n"
-    header += f"Operation took {hours:02d}:{minutes:02d}:{seconds:02d}\n"
-    header += "=" * 50 + "\n"
-    header += f"\nTotal documents: {doc_db['metadata']['total_documents']}\n"
+    header = f"Sync Completed - Generated on {timestamp}\n"
+    header += f"Operation took {hours:02d}:{minutes:02d}:{seconds:02d}\n\n"
+    header += f"Total documents: {doc_db['metadata']['total_documents']}\n"
     header += f"Active documents: {doc_db['metadata']['active_documents']}\n"
     header += f"Files updated in this sync: {files_updated}\n"
     header += f"Files deleted in this sync: {files_deleted}\n"
-    header += "=" * 50 + "\n\n" 
     
     # Initialize variables
     current_file = None
@@ -407,7 +420,7 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
     # Count header words
     header_word_count = len(header.split())
 
-    current_file_name = f"{timestamp_str}_{output_folder_name}_part{file_index}.txt"
+    current_file_name = f"{timestamp_str}_{output_folder_name}_part{file_index}.md"
     
     # Create the first file in the specified output folder path
     current_file_path = os.path.join(output_folder_path, current_file_name)
@@ -424,9 +437,11 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
             continue
             
         # Prepare document content
-        doc_header = f"\n\n===== FILE: {doc_info['name']} ({file_id}) =====\n"
-        doc_header += f"Last modified: {doc_info['modifiedTime']}\n"
-        doc_header += "=" * 50 + "\n\n"
+        doc_header = f"\n\n"
+        doc_header += f"## METADATA ##\n"
+        doc_header += f"Title: {doc_info['name']}\n"
+        doc_header += f"URL: {doc_info['url']}\n"
+        doc_header += f"Last Modified: {doc_info['modifiedTime']}\n"
         doc_content = doc_info["content"] + "\n\n"
         
         # Calculate size of this document
@@ -457,7 +472,7 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
             
             # Create a new file
             file_index += 1
-            document_part_name = f"{timestamp_str}_{output_folder_name}_part{file_index}.txt" 
+            document_part_name = f"{timestamp_str}_{output_folder_name}_part{file_index}.md" 
             current_file_path = os.path.join(output_folder_path, document_part_name)
             current_file = open(current_file_path, 'w', encoding='utf-8')
             

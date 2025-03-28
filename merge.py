@@ -19,16 +19,12 @@ def main():
     Allows user to provide a Drive URL either as a command line argument
     or through interactive input.
     """
-
-    print_intro()
-    # OUTRO will be printed in the process_documents function
-    # This is done because the outro is dependent on the output folder path, file sizes, file word counts, 
-    # total size, total word count, hours, minutes, seconds which are all determined in the process_documents function
-
     try:
         # Get the Drive service
         service = get_drive_service()
-        
+
+        print_intro()
+
         # Initialize variables
         target_id = None
         target_type = None
@@ -57,7 +53,6 @@ def main():
 
         # Process the URL if one was provided
         if url:
-            
             # Parse the URL to get the target ID and type
             target_id, target_type = parse_drive_url(url)
 
@@ -94,7 +89,11 @@ def main():
                                      target_id, target_type, 
                                      output_folder_path=output_folder_path, 
                                      output_folder_name=output_folder_name)
-            
+
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Process interrupted by user. Exiting...{RESET}")
+        sys.exit(0)
+
     except Exception as e:
         logging.error(f"Sync failed: {str(e)}")
         logging.error(traceback.format_exc())
@@ -102,8 +101,11 @@ def main():
         print("See log for details.")
 
 if __name__ == '__main__':
-    main()
-
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Process interrupted by user. Exiting...{RESET}")
+        sys.exit(0)
 
 
 

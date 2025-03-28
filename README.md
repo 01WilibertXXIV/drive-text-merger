@@ -8,9 +8,16 @@ This script merges text files from a Google Drive folder into a single file whil
 
 
 ## Installation
+Install the required packages by running the following command:
 ```bash
 pip install -r requirements.txt
 ```
+
+The app will need a file called `credentials.json` in the root directory. This file can be obtained by following the instructions [here](https://developers.google.com/workspace/guides/create-credentials?hl=fr).
+
+Follow the steps to create an OAuth 2.0 client ID for a Desktop app and download the credentials file.
+Rename the file to `credentials.json` and place it in the root directory.w
+*This file should not be shared with anyone.*
 
 ## Usage
 You can run the script in two ways:
@@ -30,7 +37,7 @@ python merge.py "https://drive.google.com/drive/folders/1234567890"
 ```
 
 ## Output
-The script generates the following outputs in the **synced_content** folder:
+The script generates the following outputs in the `synced_content` folder:
 
 1. A folder named after the Google Drive folder you provided
 2. A JSON database that tracks changes, updates, and deleted files

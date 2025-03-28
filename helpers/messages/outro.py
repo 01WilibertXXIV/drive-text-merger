@@ -94,7 +94,7 @@ def print_outro(output_folder_path, file_sizes, file_word_counts, total_size, to
     # Add context to help understand the impact
     tree_absorption = 22000  # Average tree absorbs ~22kg CO2 per year
     equivalent_tree_minutes = (total_carbon_kg / tree_absorption) * 365 * 24 * 60  # Convert to minutes
-    print(f"  • Equivalent to what an average tree absorbs in {equivalent_tree_minutes:.1f} minutes")
+    print(f"  • Equivalent to what an average tree absorbs in {equivalent_tree_minutes:.3f} minutes")
     print("\n")
     print(f"{YELLOW}Thank you for using the {APP_NAME}!{RESET}")
     print(f"\nDeveloped for the {DARK_GRAY}ArtIA experimental project{RESET} to help make sense")

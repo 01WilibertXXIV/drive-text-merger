@@ -30,6 +30,19 @@ DOCUMENT_DB_FILE = 'document_database.json'
 JSON database file for document metadata and content.
 Stored in the DATA_FOLDER to prevent accidental manual modification.
 Format: JSON with document IDs as keys and metadata/content as values.
+
+{
+    "name": name of the document in the google drive (string),
+    "url": url of the document in the google drive (string),
+    "mimeType": mime type of the document (string),
+    "modifiedTime": last modified time of the document (string),
+    "createdTime": creation time of the document (string),
+    "lastSynced": last synced time of the document (string),
+    "checksum": checksum of the document (string),
+    "content": text content of the document (string)
+}
+
+
 """
 
 SYNC_INFO_FILE = 'last_sync.txt'
