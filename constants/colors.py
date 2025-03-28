@@ -1,0 +1,9 @@
+RESET = "\033[0m"               # Reset color
+BOLD_CYAN = "\033[1;36m"        # Bold Cyan for folder names
+YELLOW = "\033[1;93m"           # Bright Yellow for filenames
+MAGENTA = "\033[0;35m"          # Magenta for status updates
+BRIGHT_BLUE = "\033[1;94m"      # Bright Blue for Drive IDs
+RED = "\033[0;31m"              # Red for errors
+GREEN = "\033[0;32m"            # Green for success
+DARK_GRAY = "\033[1;30m"        # Dark Gray for non-important text
+PINK = "\033[1;35m"             # Pink for numbers
