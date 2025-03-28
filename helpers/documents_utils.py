@@ -179,8 +179,8 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
 
                 folder_name = get_name_for_id(service, file_id=search_folder_id)
 
-                terminal_message = f"({BOLD_CYAN}{subfolders_count}{RESET}/{len(folder_ids_to_search)}) - Searching in {BOLD_CYAN}{folder_name}{RESET}                                                "
-                print(terminal_message)
+                print("\n")
+                print(f"({BOLD_CYAN}{subfolders_count}{RESET}/{len(folder_ids_to_search)}) - Searching in {BOLD_CYAN}{folder_name}{RESET}                    ")
                 
                 items = results.get('files', [])
                 logging.info(f"Found {len(items)} files in {folder_name}")
@@ -223,7 +223,18 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             done = False
 
                             logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
-                            print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True) 
+                            print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True)
+
+                            if file_name == "2x2":
+                                logging.info(f"Starting download for 2x2 file: {file_id}")
+                                
+                                while not done:
+                                    try:
+                                        status, done = downloader.next_chunk()
+                                        logging.info(f"2x2 download progress: {int(status.progress() * 100)}%")
+                                    except Exception as e:
+                                        logging.error(f"Error during 2x2 download: {str(e)}")
+                                        raise  
 
                             while not done:
                                 status, done = downloader.next_chunk()
@@ -431,6 +442,8 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
     current_word_count = header_word_count
     generated_files.append(current_file_path)
 
+    index = 1
+
     # Write all active documents
     for file_id, doc_info in doc_db["documents"].items():
         # Skip deleted documents
@@ -438,12 +451,11 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
             continue
             
         # Prepare document content
-        doc_header = f"\n\n"
-        doc_header += f"## METADATA ##\n"
+        doc_header = f"## METADATA ##\n"
         doc_header += f"Title: {doc_info['name']}\n"
         doc_header += f"URL: {doc_info['url']}\n"
         doc_header += f"Last Modified: {doc_info['modifiedTime']}\n"
-        doc_content = doc_info["content"] + "\n\n"
+        doc_content = doc_info["content"]
         
         # Calculate size of this document
         doc_size = len((doc_header + doc_content).encode('utf-8'))
@@ -487,8 +499,12 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
             print(f"Created new file: {current_file_path}")
         
         # Write document to current file
+        current_file.write(f"\n```START OF FILE {index} ```\n")
         current_file.write(doc_header)
         current_file.write(doc_content)
+        current_file.write(f"\n```END OF FILE {index} ```\n")
+
+        index += 1
         
         # Update current file size and word count
         current_file_size += doc_size

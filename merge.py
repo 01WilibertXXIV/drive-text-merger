@@ -4,7 +4,7 @@ import traceback
 import logging
 import argparse
 
-from helpers.init import init
+from helpers.init import setup
 from helpers.updater import is_update_available, update_application, restart_application    
 from helpers.drive_utils import get_name_for_id, parse_drive_url
 from helpers.auth_utils import get_drive_service
@@ -112,7 +112,7 @@ def main():
 
 if __name__ == '__main__':
 
-    init()
+    setup()
 
     args = parse_arguments()
     is_git_repo = os.path.exists(".git")
