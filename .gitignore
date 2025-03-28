@@ -20,7 +20,6 @@ credentials.json
 .spyderproject
 .spyproject
 .ropeproject
-.DS_Store
 
 # Virtual environments
 venv/
@@ -31,3 +30,7 @@ ENV/
 env.bak/
 venv.bak/
 pythonenv*
+
+# OS specific
+.DS_Store
+Thumbs.db
