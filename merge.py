@@ -3,8 +3,9 @@ import sys
 import traceback
 import logging
 import argparse
-from updater import is_update_available, update_application, restart_application    
+
 from helpers.init import init
+from helpers.updater import is_update_available, update_application, restart_application    
 from helpers.drive_utils import get_name_for_id, parse_drive_url
 from helpers.auth_utils import get_drive_service
 from helpers.sync_utils import get_last_sync_time
