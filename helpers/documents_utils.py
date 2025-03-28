@@ -10,6 +10,7 @@ import logging
 import time
 import threading
 from queue import Queue, Empty
+import subprocess
 
 from constants.colors import RESET, BOLD_CYAN, YELLOW, GREEN, DARK_GRAY
 from constants.app_data import DATA_FOLDER, DOCUMENT_DB_FILE, APP_NAME
@@ -24,11 +25,28 @@ from helpers.messages.outro import print_outro
 logging.basicConfig(filename='drive_sync.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def ensure_data_folder(output_folder_path):
+    """Ensure the data folder exists and is hidden on Windows."""
+    data_folder_path = os.path.join(output_folder_path, DATA_FOLDER)
+    
+    if not os.path.exists(data_folder_path):
+        os.makedirs(data_folder_path)
+        
+        # Hide the folder on Windows
+        if os.name == "nt":
+            subprocess.call(["attrib", "+H", data_folder_path])
+
 def load_document_database(output_folder_path):
     """Load the document database from file."""
-    if os.path.exists(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB_FILE}")):
-        with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB_FILE}"), 'r', encoding='utf-8') as f:
+    ensure_data_folder(output_folder_path)  # Ensure the folder exists and is hidden
+    
+    db_file_path = os.path.join(output_folder_path, DATA_FOLDER, DOCUMENT_DB_FILE)
+    
+    if os.path.exists(db_file_path):
+        with open(db_file_path, 'r', encoding='utf-8') as f:
             return json.load(f)
+    
     return {"documents": {}, "metadata": {"last_updated": ""}}
 
 def save_document_database(db, output_folder_path):
@@ -773,8 +791,8 @@ def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, thr
         folders_per_second = subfolder_counter['count'] / elapsed_time if elapsed_time > 0 else 0
         
         print(f"Scan completed in {elapsed_time:.1f} seconds.")
-        print(f"Found {subfolder_counter['count']} subfolders ({folders_per_second:.1f} folders/sec).")
-        print(f"Encountered {error_counter['count']} errors.")
+        print(f"Found {BOLD_CYAN}{subfolder_counter['count'] + 1}{RESET} subfolders ({folders_per_second:.1f} folders/sec).")
+        print(f"Encountered {error_counter['count']} errors.\n")
     
     return all_subfolders
 

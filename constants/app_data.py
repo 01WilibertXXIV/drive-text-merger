@@ -1,3 +1,4 @@
+import os
 
 """
 Application constants for file and directory management.
@@ -17,6 +18,11 @@ DATA_FOLDER = '.data'
 Hidden folder for storing application data.
 This folder is automatically created by the program and hidden from users
 to prevent manual modification of critical data files.
+"""
+
+DATA_FOLDER_PATH = os.path.join(os.getenv('APPDATA'), "DriveSyncMerger")
+"""
+    TO IMPLEMENT.
 """
 
 DOCUMENT_DB_FILE = 'document_database.json'
