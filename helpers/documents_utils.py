@@ -20,6 +20,7 @@ from helpers.drive_utils import get_name_for_id
 from helpers.sync_utils import save_last_sync_time, compute_checksum
 from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
 from helpers.sheet_utils import extract_complete_sheet_text
+from helpers.arbo_utils import save_folder_structure_to_excel
 from helpers.messages.outro import print_outro
 
 # Set up logging
@@ -127,7 +128,8 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
             max_workers=8, 
             throttle_delay=0.1,
             batch_size=5,
-            throttle_strategy="adaptive"
+            throttle_strategy="adaptive",
+            output_folder_path=output_folder_path
             )
         folder_ids_to_search.extend([folder['id'] for folder in subfolders])
         
@@ -424,8 +426,8 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
     # Prepare header content
     header = f"Sync Completed - Generated on {timestamp}\n"
     header += f"Operation took {hours:02d}:{minutes:02d}:{seconds:02d}\n\n"
-    header += f"Total documents: {doc_db['metadata']['total_documents']}\n"
-    header += f"Active documents: {doc_db['metadata']['active_documents']}\n"
+    header += f"Total documents: {doc_db['metadata'].get('total_documents', 'N/A')}\n"
+    header += f"Active documents: {doc_db['metadata'].get('active_documents', 'N/A')}\n"
     header += f"Files updated in this sync: {files_updated}\n"
     header += f"Files deleted in this sync: {files_deleted}\n"
     
@@ -459,9 +461,9 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
             
         # Prepare document content
         doc_header = f"## METADATA ##\n"
-        doc_header += f"Title: {doc_info['name']}\n"
-        doc_header += f"URL: {doc_info['url']}\n"
-        doc_header += f"Last Modified: {doc_info['modifiedTime']}\n"
+        doc_header += f"Title: {doc_info.get('name', 'N/A')}\n"
+        doc_header += f"URL: {doc_info.get('url', 'N/A')}\n"
+        doc_header += f"Last Modified: {doc_info.get('modifiedTime', 'N/A')}\n"
         doc_content = doc_info["content"]
         
         # Calculate size of this document
@@ -539,7 +541,7 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
 
 #region Multithreaded Subfolder Scanning
 def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, throttle_delay=0.05, 
-                                    batch_size=5, throttle_strategy="adaptive"):
+                                    batch_size=5, throttle_strategy="adaptive", output_folder_path=None):
     """
     Get all subfolders using optimized multithreading.
     
@@ -832,6 +834,10 @@ def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, thr
         print(f"Scan completed in {elapsed_time:.1f} seconds.")
         print(f"Found {BOLD_CYAN}{subfolder_counter['count'] + 1}{RESET} subfolders ({folders_per_second:.1f} folders/sec).")
         print(f"Encountered {error_counter['count']} errors.\n")
+
+    # Save the subfolder structure to an Excel file
+    output_file = os.path.join(output_folder_path, "subfolder_structure.xlsx")
+    save_folder_structure_to_excel(all_subfolders, output_file)
     
     return all_subfolders
 
