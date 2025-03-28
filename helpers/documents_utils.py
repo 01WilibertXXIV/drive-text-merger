@@ -12,8 +12,8 @@ import threading
 from queue import Queue, Empty
 import subprocess
 
-from constants.colors import RESET, BOLD_CYAN, YELLOW, GREEN, DARK_GRAY
-from constants.app_data import DATA_FOLDER, DOCUMENT_DB_FILE, APP_NAME
+from constants.colors import RESET, BOLD_CYAN, YELLOW, GREEN, DARK_GRAY, RED
+from constants.app_data import DATA_FOLDER, DOCUMENT_DB_FILE, APP_NAME  
 from constants.time_data import START_TIME, START_TIME_STRING
 
 from helpers.drive_utils import get_name_for_id
@@ -179,7 +179,7 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
 
                 folder_name = get_name_for_id(service, file_id=search_folder_id)
 
-                print("\n")
+                print("")
                 print(f"({BOLD_CYAN}{subfolders_count}{RESET}/{len(folder_ids_to_search)}) - Searching in {BOLD_CYAN}{folder_name}{RESET}                    ")
                 
                 items = results.get('files', [])
@@ -225,21 +225,22 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
                             print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True)
 
-                            if file_name == "2x2":
-                                logging.info(f"Starting download for 2x2 file: {file_id}")
-                                
+                            try:
                                 while not done:
-                                    try:
-                                        status, done = downloader.next_chunk()
-                                        logging.info(f"2x2 download progress: {int(status.progress() * 100)}%")
-                                    except Exception as e:
-                                        logging.error(f"Error during 2x2 download: {str(e)}")
-                                        raise  
-
-                            while not done:
-                                status, done = downloader.next_chunk()
-                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {int(status.progress() * 100)}%                            ", end="", flush=True)
-                            print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated!{RESET}                                       ") 
+                                    status, done = downloader.next_chunk()
+                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {int(status.progress() * 100)}%                            ", end="", flush=True)
+                                
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated!{RESET}                                       ")
+                                
+                            except Exception as e:
+                                # Handle the error and display it to the user
+                                error_message = str(e)
+                                if "403" in error_message and "fileNotDownloadable" in error_message:
+                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: File not downloadable (Permission denied){RESET}                ")
+                                else:
+                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: {str(e)}{RESET}                ")
+                                
+                                logging.error(f"Error downloading {file_name}: {error_message}")
 
                             # Add downloaded bytes to total bandwidth
                             file_data_size = len(file_data.getvalue())
@@ -261,7 +262,13 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                             if mime_type == 'application/vnd.google-apps.document' or mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
                                 text = extract_text_from_docx(file_data.getvalue(), file_url)
                             elif mime_type == 'application/pdf':
-                                text = extract_text_from_pdf(file_data.getvalue(), file_url)
+                                try:
+                                    text = extract_text_from_pdf(file_data.getvalue(), file_url)
+                                    if text is None:
+                                        text = f"[PDF text extraction failed. View file at {file_url}]"
+                                except Exception as pdf_error:
+                                    logging.error(f"PDF extraction error: {str(pdf_error)}")
+                                    text = f"[Error extracting PDF content: {str(pdf_error)}. View file at {file_url}]"
                             elif mime_type in [
                                 'application/vnd.google-apps.spreadsheet',
                                 'application/vnd.ms-excel',
