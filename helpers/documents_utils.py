@@ -11,7 +11,8 @@ import time
 import threading
 from queue import Queue, Empty
 import subprocess
-
+import marqo
+from helpers.marqo_utils import MarqoDocumentManager
 from constants.colors import RESET, BOLD_CYAN, YELLOW, GREEN, DARK_GRAY, RED
 from constants.app_data import DATA_FOLDER, DOCUMENT_DB_FILE, APP_NAME  
 from constants.time_data import START_TIME, START_TIME_STRING
@@ -54,6 +55,11 @@ def save_document_database(db, output_folder_path):
     """Save the document database to file."""
     with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB_FILE}"), 'w', encoding='utf-8') as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
+
+def save_to_vector_store(db):
+    
+    marqo_client = marqo.Client(url="http://gk4k0ckgck04g04ow8w08wws.100.71.51.35.sslip.io/")
+    marqo_client = MarqoDocumentManager(marqo_client, "documents")
 
 
 #region Process Documents
