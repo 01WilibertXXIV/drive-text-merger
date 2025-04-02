@@ -1,4 +1,7 @@
 import re
+import logging
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 def markdown_based_chunking(text, max_chunk_size=500):
     # Split by major headings first (## or higher)
     sections = re.split(r'(?<=\n)#{1,3}\s+[^\n]+\n', text)
@@ -33,3 +36,41 @@ def markdown_based_chunking(text, max_chunk_size=500):
                 chunks.append(" ".join(current_chunk))
     
     return chunks
+
+
+def chunk_text_recursive(
+    text: str,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200
+) -> list[str]:
+    """
+    Chunks text using Langchain's RecursiveCharacterTextSplitter.
+
+    Args:
+        text: The text content to chunk.
+        chunk_size: The target size for each chunk.
+        chunk_overlap: The overlap between consecutive chunks.
+
+    Returns:
+        A list of text chunks.
+    """
+    if not text:
+        logging.warning("Received empty text for chunking.")
+        return []
+    try:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+            add_start_index=False, # Keep chunks cleaner for embedding
+        )
+        chunks = splitter.split_text(text)
+        logging.debug(f"Chunked text into {len(chunks)} chunks.")
+        return chunks
+    except Exception as e:
+        logging.error(f"Error during recursive text chunking: {e}")
+        # Fallback: return the original text as a single chunk if splitting fails
+        return [text]
+
+
+

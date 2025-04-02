@@ -1,11 +1,10 @@
 import os
 import json
-import hashlib
-import traceback
 import time
 import datetime
 from googleapiclient.http import MediaIoBaseDownload
 import io
+import googleapiclient
 import logging
 import time
 import threading
@@ -22,6 +21,14 @@ from helpers.sync_utils import save_last_sync_time, compute_checksum
 from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
 from helpers.sheet_utils import extract_complete_sheet_text
 from helpers.messages.outro import print_outro
+
+from helpers.vectors.chunking_utils import chunk_text_recursive as chunk_document_text
+
+from helpers.vector_store_marqo_utils import (
+    upsert_document_marqo as upsert_document_to_vector_store,
+    delete_document_marqo as delete_document_from_vector_store,
+    setup_marqo_index as setup_vector_store
+)
 
 # Set up logging
 logging.basicConfig(filename='drive_sync.log', level=logging.INFO,
@@ -75,7 +82,21 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
     
     # Track the current time for the next sync point
     current_time = datetime.datetime.now(datetime.UTC).isoformat() + 'Z'
-    
+
+    try:
+        print("Setting up Marqo Vector Store...")
+        MARQO_URL = "http://gk4k0ckgck04g04ow8w08wws.100.71.51.35.sslip.io/"
+        MARQO_INDEX_NAME = "documents"
+        mq = marqo.Client(url=MARQO_URL)
+        print("Connecting to Marqo...")
+        setup_vector_store(mq, MARQO_INDEX_NAME)
+        logging.info(f"Connected to Marqo at {MARQO_URL} and ensured index '{MARQO_INDEX_NAME}' exists.")
+    except Exception as e:
+        logging.error(f"FATAL: Could not connect to or setup Marqo Vector Store at {MARQO_URL}. Aborting sync. Error: {e}", exc_info=True)
+        print(f"{RED}FATAL: Could not connect to Marqo Vector Store. Check Marqo instance and configuration.{RESET}")
+        return doc_db # Return the potentially unmodified doc_db
+
+
     print()
     if(start_time == "1970-01-01T00:00:00.000Z"):
         print(f"First time running this script, building database from scratch. \nThis may take a while...")
@@ -165,8 +186,6 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                 f"and '{search_folder_id}' in parents"
             )
 
-
-            
             page_token = None
             while True:
                 list_params = {
@@ -181,223 +200,272 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                 if page_token:
                     list_params['pageToken'] = page_token
                 
-                results = service.files().list(**list_params).execute()
+                try:
+                    results = service.files().list(**list_params).execute()
+                except Exception as api_error:
+                    logging.error(f"Google Drive API error listing files in {search_folder_id}: {api_error}", exc_info=True)
+                    print(f"{RED}API Error listing files in {search_folder_id}. Skipping folder.{RESET}")
+                    break # Skip to next folder on error
 
                 folder_name = get_name_for_id(service, file_id=search_folder_id)
-
-                print("")
-                print(f"({BOLD_CYAN}{subfolders_count}{RESET}/{len(folder_ids_to_search)}) - Searching in {BOLD_CYAN}{folder_name}{RESET}                    ")
+                print(f"\n({BOLD_CYAN}{subfolders_count}{RESET}/{len(folder_ids_to_search)}) - Searching in {BOLD_CYAN}{folder_name}{RESET}                    ")
                 
                 items = results.get('files', [])
                 logging.info(f"Found {len(items)} files in {folder_name}")
 
-                if(len(items) == 0):
-                    print(f"  {DARK_GRAY}No doc, pdf, or docx files found in this folder{RESET}")
+                if not items:
+                    print(f"  {DARK_GRAY}No relevant files found in this folder.{RESET}")
                 else:
-                    print(f"  Found {YELLOW}{len(items)}{RESET} doc, pdf, or docx files")
+                    print(f"  Found {YELLOW}{len(items)}{RESET} relevant files.")
 
                 processed_files_count = 0
                 files_to_process = len(items)
 
                 for item in items:
                     file_id = item['id']
+                    file_name = item['name']
+                    mime_type = item['mimeType']
+                    modified_time_str = item['modifiedTime']
+
                     active_file_ids.add(file_id)
 
-                    # Check if this file is new or modified since last sync
-                    if (file_id not in doc_db["documents"] or 
-                        item['modifiedTime'] > start_time):
+                    # Check if file needs processing (new or modified)
+                    should_process = (file_id not in doc_db.get("documents", {}) or
+                                       modified_time_str > doc_db.get("documents", {}).get(file_id, {}).get("modifiedTime", "1970-01-01T00:00:00.000Z"))
+
+                    if should_process:
                         changes_processed += 1
+                        print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...", end="", flush=True)
                         try:
-                            file_name = item['name']
-                            mime_type = item['mimeType']
-                        
-                            
-                            # For Google Docs, we need to export as DOCX
-                            export_params = {
-                                'fileId': file_id,
-                            }
-                            
+                            # --- Download File Content (Modified for clarity) ---
+                            request = None
+                            export_mime_type = None # Track what we actually download
+
                             if mime_type == 'application/vnd.google-apps.document':
-                                export_params['mimeType'] = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                                request = service.files().export_media(**export_params)
-                            else:
+                                export_mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                                request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+                            elif mime_type == 'application/vnd.google-apps.spreadsheet':
+                                export_mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                                request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+                            elif mime_type in ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv']:
+                                export_mime_type = mime_type # It's already in a downloadable format
                                 request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                            
-                            # Download the file content
+                            else:
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}Unsupported native type ({mime_type}). Skipping.{RESET}        ")
+                                logging.warning(f"Skipping file {file_name} ({file_id}) due to unsupported native mimeType: {mime_type}")
+                                continue # Skip to next file
+
                             file_data = io.BytesIO()
                             downloader = MediaIoBaseDownload(file_data, request)
                             done = False
+                            while not done:
+                                status, done = downloader.next_chunk()
+                                if status:
+                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - Downloading {int(status.progress() * 100)}%...", end="", flush=True)
 
-                            logging.info(f"Processing file: {file_name} ({file_id}) - {mime_type}")
-                            print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...                                      ", end="", flush=True)
-
-                            try:
-                                while not done:
-                                    status, done = downloader.next_chunk()
-                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {int(status.progress() * 100)}%                            ", end="", flush=True)
-                                
-                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated!{RESET}                                       ")
-                                
-                            except Exception as e:
-                                # Handle the error and display it to the user
-                                error_message = str(e)
-                                if "403" in error_message and "fileNotDownloadable" in error_message:
-                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: File not downloadable (Permission denied){RESET}                ")
-                                else:
-                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: {str(e)}{RESET}                ")
-                                
-                                logging.error(f"Error downloading {file_name}: {error_message}")
-
-                            # Add downloaded bytes to total bandwidth
-                            file_data_size = len(file_data.getvalue())
+                            file_content_bytes = file_data.getvalue()
+                            file_data_size = len(file_content_bytes)
                             total_download_bandwidth += file_data_size
-                            logging.info(f"Downloaded {file_data_size} bytes for {file_name}")
-                            
-                            elapsed_time = time.time() - START_TIME
-                            progress_percentage = (subfolders_count / len(folder_ids_to_search)) * 100
+                            logging.info(f"Downloaded {file_data_size} bytes for {file_name} ({file_id}) as {export_mime_type}")
 
-                            progress_bar_width = 36
-                            filled_width = int(progress_percentage / 100 * progress_bar_width)
-                            bar = '=' * filled_width + '-' * (progress_bar_width - filled_width)
-
-                            # print(f'\r[{bar}] {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s', end='\r', flush=True)
-
+                            # --- Extract Text ---
+                            text = None
                             file_url = item.get("webViewLink", "N/A")
 
-                            # Extract text based on file type
-                            if mime_type == 'application/vnd.google-apps.document' or mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                                text = extract_text_from_docx(file_data.getvalue(), file_url)
-                            elif mime_type == 'application/pdf':
-                                try:
-                                    text = extract_text_from_pdf(file_data.getvalue(), file_url)
-                                    if text is None:
-                                        text = f"[PDF text extraction failed. View file at {file_url}]"
-                                except Exception as pdf_error:
-                                    logging.error(f"PDF extraction error: {str(pdf_error)}")
-                                    text = f"[Error extracting PDF content: {str(pdf_error)}. View file at {file_url}]"
-                            elif mime_type in [
-                                'application/vnd.google-apps.spreadsheet',
-                                'application/vnd.ms-excel',
-                                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                'text/csv',
-                                'application/csv'
-                            ]:
-                                text = extract_complete_sheet_text(file_data.getvalue(), file_name, file_url)
+                            # Use the EXPORTED mime type to decide extraction method
+                            if export_mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                                text = extract_text_from_docx(file_content_bytes, file_url)
+                            elif export_mime_type == 'application/pdf':
+                                text = extract_text_from_pdf(file_content_bytes, file_url)
+                                if text is None: text = f"[PDF text extraction failed. View file at {file_url}]"
+                            elif export_mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv']:
+                                text = extract_complete_sheet_text(file_content_bytes, file_name, file_url)
                             else:
-                                text = f"Unsupported format: {mime_type} for file {file_name}"
-                            
-                            # Compute checksum to check if content actually changed
+                                text = f"[Unsupported format for text extraction: {export_mime_type}]"
+                                logging.warning(f"No text extraction method for downloaded type {export_mime_type} from file {file_name}")
+
+                            if not text:
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Failed to extract text.{RESET}                             ")
+                                logging.error(f"Text extraction resulted in empty content for {file_name} ({file_id})")
+                                continue # Skip if text extraction fails
+
+                            # --- Compute Checksum ---
                             checksum = compute_checksum(text)
-                            
-                            # Check if we have this file already and if the content has changed
-                            if (file_id not in doc_db["documents"] or 
-                                doc_db["documents"][file_id]["checksum"] != checksum):
-                                
-                                # Store the document in our database
+
+                            # --- Check if Content *Actually* Changed ---
+                            if (file_id not in doc_db.get("documents", {}) or
+                                doc_db.get("documents", {}).get(file_id, {}).get("checksum") != checksum):
+
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Content changed. Updating...{RESET}                ", end="", flush=True)
+
+                                # --- Chunk Document ---
+                                chunks = chunk_document_text(text)
+                                logging.info(f"Chunked '{file_name}' into {len(chunks)} chunks.")
+
+                                # --- Prepare Metadata for Vector Store ---
+                                vector_store_metadata = {
+                                    "file_name": file_name,
+                                    "url": file_url,
+                                    "mime_type": mime_type, # Store original mime type
+                                    "modified_time": modified_time_str,
+                                    "created_time": item['createdTime'],
+                                    # Add any other relevant metadata from 'item' or elsewhere
+                                }
+
+                                # --- Upsert to Vector Store ---
+                                try:
+                                    upsert_document_to_vector_store(
+                                        vector_store_client=mq,
+                                        index_name=MARQO_INDEX_NAME,
+                                        file_id=file_id,
+                                        chunks=chunks,
+                                        metadata=vector_store_metadata
+                                    )
+                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated & Stored in Vector DB!{RESET}        ")
+                                    files_updated += 1 # Count as updated only if vector store succeeds? Your choice.
+
+                                except Exception as vs_error:
+                                    logging.error(f"Failed to upsert {file_name} ({file_id}) to vector store: {vs_error}", exc_info=True)
+                                    # Decide if failure to update vector store should halt the process or just be logged
+                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Updated Locally, Vector DB FAILED!{RESET}    ")
+                                    # Potentially skip adding to doc_db or flag it? For now, we proceed to update doc_db.
+
+                                # --- Update Local Document Database (doc_db) ---
+                                if "documents" not in doc_db: doc_db["documents"] = {}
                                 doc_db["documents"][file_id] = {
                                     "name": file_name,
-                                    "url": item.get("webViewLink", "N/A"),
+                                    "url": file_url,
                                     "mimeType": mime_type,
-                                    "modifiedTime": item['modifiedTime'],
+                                    "modifiedTime": modified_time_str,
                                     "createdTime": item['createdTime'],
                                     "lastSynced": current_time,
                                     "checksum": checksum,
-                                    "content": text
+                                    "content": text, # Keep full text locally, or remove if only needed for chunking
+                                    "deleted": False # Explicitly mark as not deleted
                                 }
-                                files_updated += 1
-                            else:
-                                # Just update the lastSynced time
-                                doc_db["documents"][file_id]["lastSynced"] = current_time
-                                doc_db["documents"][file_id]["url"] = item.get("webViewLink", "N/A")
+                                # files_updated += 1 # Moved this up to after successful vector store update
 
-                            processed_files_count += 1
-                         
+                            else:
+                                # Checksum is the same, content hasn't changed
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}No content change detected. Updated sync time.{RESET} ")
+                                # Update lastSynced time and URL in local DB even if content is the same
+                                if file_id in doc_db.get("documents", {}):
+                                    doc_db["documents"][file_id]["lastSynced"] = current_time
+                                    doc_db["documents"][file_id]["url"] = file_url # URL might change
+
+
+                        except googleapiclient.errors.HttpError as download_error:
+                             # Specific check for permissions or download issues
+                             error_content = download_error.resp.get('content', b'').decode('utf-8')
+                             if "fileNotDownloadable" in error_content or "cannotDownloadAbusiveFile" in error_content:
+                                 print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: File not downloadable (Permission/Policy).{RESET} ")
+                                 logging.warning(f"Cannot download file {file_name} ({file_id}): {error_content}")
+                             else:
+                                 print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Download Error: {download_error}{RESET} ")
+                                 logging.error(f"Error downloading {file_name} ({file_id}): {download_error}", exc_info=True)
                         except Exception as e:
-                            logging.error(f"Error processing file {file_id}: {str(e)}")
-                            logging.error(traceback.format_exc())
-                            # print(f"Error processing file: {str(e)}")
-                            # print(f"Error processing file: {file_name} ({file_id}) - {mime_type}")
+                            logging.error(f"Error processing file {file_name} ({file_id}): {str(e)}", exc_info=True)
+                            print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: {str(e)}{RESET}         ")
 
                     else:
-                        file_name = item['name']
-                        print(f"  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}No changes detected. Skipping!{RESET}                                           ")
+                        # File exists and modifiedTime is not newer than last sync
+                        print(f"  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}No changes detected. Skipping.{RESET}")
+                        # Important: Still add to active_file_ids even if skipped
+                        active_file_ids.add(file_id)
+                        # Optionally update lastSynced time? Maybe not necessary if modifiedTime hasn't changed.
+                        if file_id in doc_db.get("documents", {}):
+                             doc_db["documents"][file_id]["lastSynced"] = current_time # Keep sync time fresh
 
-                    elapsed_time = time.time() - START_TIME
-                    progress_percentage = (subfolders_count / len(folder_ids_to_search)) * 100
 
-                    progress_bar_width = 36
-                    filled_width = int(progress_percentage / 100 * progress_bar_width)
-                    bar = '=' * filled_width + '-' * (progress_bar_width - filled_width)
-
-                    # print(f'\r[{bar}] {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s', end='\r', flush=True)
-
-                # if(processed_files_count != files_to_process):
-                #     print(f"  {files_to_process - processed_files_count} files did not require an update.")
-
-                # print(" " * 100)   
-                
                 page_token = results.get('nextPageToken')
                 if not page_token:
-                    break
+                    break # Exit while loop for the current folder
 
+            # Progress indication (optional)
             elapsed_time = time.time() - START_TIME
             progress_percentage = (subfolders_count / len(folder_ids_to_search)) * 100
-
-            progress_bar_width = 36
-            filled_width = int(progress_percentage / 100 * progress_bar_width)
-            bar = '=' * filled_width + '-' * (progress_bar_width - filled_width)
-            
-            # print(f'\r[{bar}] {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s', end='\r', flush=True)
-            #sys.stdout.write(f'\r[{bar}] {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s')
-            #sys.stdout.flush()
+            # Add your progress bar logic here if desired
+            # print(f'\rProgress: {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s', end='', flush=True)
 
             subfolders_count += 1
+            time.sleep(0.1) # Small delay between folders to avoid hitting rate limits aggressively
 
-        print()
-        
-        # Identify deleted files (in our DB but not in active files)
-        # Only do this for the entire drive if no specific target was provided
-        if not target_id:
-            deleted_files = existing_file_ids - active_file_ids
-            for file_id in deleted_files:
-                if file_id in doc_db["documents"]:
-                    file_name = doc_db["documents"][file_id]["name"]
-                    logging.info(f"File deleted: {file_name} ({file_id})")
-                    print(f"File deleted: {file_name}")
-                    # Mark as deleted but keep the content for reference
-                    doc_db["documents"][file_id]["deleted"] = True
-                    doc_db["documents"][file_id]["deletedTime"] = current_time
-                    files_deleted += 1
-    
+        print("\n") # Newline after folder processing
+
+        # --- Handle Deleted Files ---
+        # Compare files seen in this run (active_file_ids) vs files in DB (existing_file_ids)
+        # Only perform deletion check if we scanned the whole intended scope (e.g., not targeting a specific subfolder run)
+        # This logic might need refinement depending on whether a run targets a subset or the whole corpus
+        # For simplicity, let's assume if target_id wasn't specified, we scanned everything relevant
+        if not target_id: # Only check for deletions if doing a full scan (adjust as needed)
+             deleted_file_ids = existing_file_ids - active_file_ids
+             if deleted_file_ids:
+                print(f"Checking {len(deleted_file_ids)} potentially deleted files...")
+             for file_id in deleted_file_ids:
+                 if file_id in doc_db.get("documents", {}):
+                     # Check if it wasn't already marked as deleted
+                     if not doc_db["documents"][file_id].get("deleted", False):
+                         file_name = doc_db["documents"][file_id].get("name", "Unknown Name")
+                         print(f"File deleted or moved: {YELLOW}{file_name}{RESET} ({file_id})")
+                         logging.info(f"Marking file as deleted: {file_name} ({file_id})")
+
+                         # Mark as deleted in local DB
+                         doc_db["documents"][file_id]["deleted"] = True
+                         doc_db["documents"][file_id]["deletedTime"] = current_time
+                         files_deleted += 1
+
+                         # --- Delete from Vector Store ---
+                         try:
+                             delete_document_from_vector_store(
+                                 vector_store_client=mq,
+                                 index_name=MARQO_INDEX_NAME,
+                                 file_id=file_id
+                             )
+                             logging.info(f"Deleted chunks for file {file_id} from vector store.")
+                         except Exception as vs_del_error:
+                              logging.error(f"Failed to delete file {file_id} from vector store: {vs_del_error}", exc_info=True)
+                              print(f"{RED}Failed to delete {file_name} from vector store.{RESET}")
+        else:
+            logging.info(f"Target ID ({target_id}) was specified. Skipping deletion check for files outside this target.")
+            print(f"{DARK_GRAY}Target specified, skipping deletion check for files outside the target scope.{RESET}")
+
+
     except Exception as e:
-        logging.error(f"Error in sync process: {str(e)}")
-        logging.error(traceback.format_exc())
-        print(f"Error in sync process: {str(e)}")
-    
+        logging.error(f"Critical error during sync process: {str(e)}", exc_info=True)
+        print(f"{RED}Critical error in sync process: {str(e)}{RESET}")
+
+    # --- Finalize and Save ---
     # Update the database metadata
+    if "metadata" not in doc_db: doc_db["metadata"] = {} # Initialize if first run
     doc_db["metadata"]["last_updated"] = current_time
-    doc_db["metadata"]["total_documents"] = len(doc_db["documents"])
-    doc_db["metadata"]["active_documents"] = len([doc for doc_id, doc in doc_db["documents"].items() if not doc.get("deleted", False)])
-    
-    # Save the document database
-    save_document_database(doc_db, output_folder_path)
-    
-    # Generate the merged file with all content
-    generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path, output_folder_name, total_download_bandwidth)
-    
+    doc_db["metadata"]["total_documents"] = len(doc_db.get("documents", {}))
+    doc_db["metadata"]["active_documents"] = len([
+        doc_id for doc_id, doc in doc_db.get("documents", {}).items() if not doc.get("deleted", False)
+    ])
+
+    # Save the document database (contains metadata and potentially full text)
+    if output_folder_path:
+        save_document_database(doc_db, output_folder_path)
+
+    # Generate the merged file (if still needed)
+    if output_folder_path and output_folder_name:
+        generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path, output_folder_name, total_download_bandwidth)
+
     # Update the last sync time
-    save_last_sync_time(current_time, output_folder_path)
+    if output_folder_path:
+        save_last_sync_time(current_time, output_folder_path)
 
-    # duration = datetime.datetime.now() - start_time
-    # hours, remainder = divmod(int(duration.total_seconds()), 3600)
-    # minutes, seconds = divmod(remainder, 60)
-    
-    logging.info(f"Sync completed. Processed {changes_processed} changes, updated {files_updated} files, deleted {files_deleted} files.")
-    # logging.info(f"Total operation time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+    logging.info(f"Sync completed. Processed {changes_processed} potential changes, updated {files_updated} files, marked {files_deleted} as deleted.")
+    # Add timing summary if needed
 
-    # print(f"Total operation time: {hours:02d}:{minutes:02d}:{seconds:02d}")
-    
+    print(f"\nSync Summary:")
+    print(f"  Files Updated/Added: {GREEN}{files_updated}{RESET}")
+    print(f"  Files Deleted/Moved: {YELLOW}{files_deleted}{RESET}")
+    # print(f"  Total Download: {total_download_bandwidth / (1024*1024):.2f} MB") # Example stat
+
     return doc_db
+
 #endregion
 
 
