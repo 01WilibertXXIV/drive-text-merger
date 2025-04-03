@@ -82,20 +82,8 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
     
     # Track the current time for the next sync point
     current_time = datetime.datetime.now(datetime.UTC).isoformat() + 'Z'
-
-    try:
-        print("Setting up Marqo Vector Store...")
-        MARQO_URL = "http://gk4k0ckgck04g04ow8w08wws.100.71.51.35.sslip.io/"
-        MARQO_INDEX_NAME = "documents"
-        mq = marqo.Client(url=MARQO_URL)
-        print("Connecting to Marqo...")
-        setup_vector_store(mq, MARQO_INDEX_NAME)
-        logging.info(f"Connected to Marqo at {MARQO_URL} and ensured index '{MARQO_INDEX_NAME}' exists.")
-    except Exception as e:
-        logging.error(f"FATAL: Could not connect to or setup Marqo Vector Store at {MARQO_URL}. Aborting sync. Error: {e}", exc_info=True)
-        print(f"{RED}FATAL: Could not connect to Marqo Vector Store. Check Marqo instance and configuration.{RESET}")
-        return doc_db # Return the potentially unmodified doc_db
-
+    index_name = "documents"
+    client = setup_vector_store(index_name)
 
     print()
     if(start_time == "1970-01-01T00:00:00.000Z"):
@@ -315,9 +303,10 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
 
                                 # --- Upsert to Vector Store ---
                                 try:
+                                    print(f"Upserting {file_name} ({file_id}) to vector store with index name: {index_name}")
                                     upsert_document_to_vector_store(
-                                        vector_store_client=mq,
-                                        index_name=MARQO_INDEX_NAME,
+                                        vector_store_client=client,
+                                        index_name=index_name,
                                         file_id=file_id,
                                         chunks=chunks,
                                         metadata=vector_store_metadata
@@ -418,8 +407,8 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                          # --- Delete from Vector Store ---
                          try:
                              delete_document_from_vector_store(
-                                 vector_store_client=mq,
-                                 index_name=MARQO_INDEX_NAME,
+                                 vector_store_client=client,
+                                 index_name=index_name,
                                  file_id=file_id
                              )
                              logging.info(f"Deleted chunks for file {file_id} from vector store.")

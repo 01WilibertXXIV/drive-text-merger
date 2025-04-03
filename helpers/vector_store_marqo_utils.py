@@ -3,12 +3,19 @@ import marqo
 import logging
 import uuid # To generate unique chunk IDs if needed
 
-def setup_marqo_index(client: marqo.Client, index_name: str):
+def setup_marqo_index(index_name: str):
     """Creates the Marqo index if it doesn't exist with recommended settings."""
+
+    print("Setting up Marqo Vector Store...")
+    MARQO_URL = "http://gk4k0ckgck04g04ow8w08wws.100.71.51.35.sslip.io/"
+    mq = marqo.Client(url=MARQO_URL)
+    print("Connecting to Marqo...")
+
     try:
         print(f"Checking if Marqo index '{index_name}' exists...")
-        client.index(index_name).get_stats()
+        mq.index(index_name).get_stats()
         logging.info(f"Marqo index '{index_name}' already exists.")
+        return mq
     except Exception: # TODO: Check for specific "index not found" error
         logging.info(f"Creating Marqo index '{index_name}'...")
         try:
@@ -35,9 +42,10 @@ def setup_marqo_index(client: marqo.Client, index_name: str):
             }
             print(f"Attempting to create Marqo index '{index_name}' with v2.16 settings: {settings}") # Updated log
             logging.info(f"Attempting to create Marqo index '{index_name}' with v2.16 settings: {settings}") # Updated log
-            client.create_index(index_name, settings_dict=settings)
+            mq.create_index(index_name, settings_dict=settings)
             print(f"Successfully created Marqo index '{index_name}'.")
             logging.info(f"Successfully created Marqo index '{index_name}'.")
+            return mq
         except Exception as e:
             logging.error(f"Failed to create Marqo index '{index_name}': {e}", exc_info=True)
             raise # Re-raise the exception to signal failure
@@ -107,7 +115,6 @@ def upsert_document_marqo(
             try:
                 add_response = vector_store_client.index(index_name).add_documents(
                     documents=[doc],
-                    tensor_fields=["chunk_text"]
                 )
                 print(f"Successfully added document {doc['_id']}")
             except Exception as e:
