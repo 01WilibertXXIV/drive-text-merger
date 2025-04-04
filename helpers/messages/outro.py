@@ -3,6 +3,8 @@ from constants.app_data import APP_NAME
 import os
 import logging
 import subprocess
+from datetime import datetime
+import json
 
 def print_outro(output_folder_path, file_sizes, file_word_counts, total_size, total_word_count, hours, minutes, seconds, download_bandwidth):
 
@@ -100,6 +102,62 @@ def print_outro(output_folder_path, file_sizes, file_word_counts, total_size, to
     print(f"\nDeveloped for the {DARK_GRAY}ArtIA experimental project{RESET} to help make sense")
     print("of the AI knowledge landscape by organizing and merging documents.")
     print()
-    print("Made with ❤️ by @WilibertXXIV") #add collaborators here
+    print("                                               @WilibertXXIV") #add collaborators here
+    print("                                                     -xxx-")
     print("="*50 + "\n")
 
+    save_results_to_json(download_carbon_g, download_bandwidth_mb, output_carbon_g,
+                        total_size_mb, processing_carbon_g, processing_time_minutes,
+                        total_carbon_g, total_carbon_kg)
+
+
+
+
+
+def save_results_to_json(download_carbon_g, download_bandwidth_mb, output_carbon_g,
+                         total_size_mb, processing_carbon_g, processing_time_minutes,
+                         total_carbon_g, total_carbon_kg, equivalent_tree_minutes, filename="carbon_footprint_log.json"):
+    """
+    Stores the carbon footprint results in a JSON file.
+    Appends the new results to the file if it exists, otherwise creates it.
+    """
+    timestamp = datetime.now().isoformat()
+    data_to_store = {
+        "timestamp": timestamp,
+        "download": {
+            "carbon_g": download_carbon_g,
+            "bandwidth_mb": download_bandwidth_mb
+        },
+        "output": {
+            "carbon_g": output_carbon_g,
+            "size_mb": total_size_mb
+        },
+        "processing": {
+            "carbon_g": processing_carbon_g,
+            "time_minutes": processing_time_minutes
+        },
+        "total": {
+            "carbon_g": total_carbon_g,
+            "carbon_kg": total_carbon_kg
+        },
+        "equivalent_tree_minutes": equivalent_tree_minutes
+    }
+
+    try:
+        with open(filename, 'r+') as f:
+            try:
+                existing_data = json.load(f)
+                if isinstance(existing_data, list):
+                    existing_data.append(data_to_store)
+                    f.seek(0)  # Go to the beginning of the file
+                    json.dump(existing_data, f, indent=4)
+                    f.truncate() # Remove remaining part if new data is shorter
+                else:
+                    # Handle case where the file might not have a list initially
+                    json.dump([existing_data, data_to_store], f, indent=4)
+            except json.JSONDecodeError:
+                # Handle case where the file is empty or not valid JSON
+                json.dump([data_to_store], f, indent=4)
+    except FileNotFoundError:
+        with open(filename, 'w') as f:
+            json.dump([data_to_store], f, indent=4)

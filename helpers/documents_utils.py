@@ -22,6 +22,7 @@ from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
 from helpers.sheet_utils import extract_complete_sheet_text
 from helpers.arbo_utils import save_folder_structure_to_excel
 from helpers.messages.outro import print_outro
+from helpers.vectors.chunking_utils import extract_and_chunk_docx_for_marqo
 
 # Set up logging
 logging.basicConfig(filename='drive_sync.log', level=logging.INFO,
@@ -58,7 +59,7 @@ def save_document_database(db, output_folder_path):
 
 
 #region Process Documents
-def process_documents(service, start_time, doc_db, target_id=None, target_type=None, output_folder_path=None, output_folder_name=None):
+def process_documents(service, start_time, doc_db, target_id=None, target_type=None, output_folder_path=None, output_folder_name=None, structure=False):
     """
     Enhanced process_documents to recursively search through all subfolders
     """
@@ -129,7 +130,8 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
             throttle_delay=0.1,
             batch_size=5,
             throttle_strategy="adaptive",
-            output_folder_path=output_folder_path
+            output_folder_path=output_folder_path,
+            structure=structure
             )
         folder_ids_to_search.extend([folder['id'] for folder in subfolders])
         
@@ -168,10 +170,10 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                 list_params = {
                     'q': query,
                     'pageSize': 100,
-                    'fields': "nextPageToken, files(id, name, mimeType, modifiedTime, createdTime, webViewLink)",
+                    'fields': "nextPageToken, files(id, name, mimeType, modifiedTime, createdTime, webViewLink, owners, lastModifyingUser, capabilities, trashed, parents)",
                     'spaces': 'drive',
                     'supportsAllDrives': True,
-                    'includeItemsFromAllDrives': True
+                    'includeItemsFromAllDrives': True,
                 }
                 
                 if page_token:
@@ -283,21 +285,28 @@ def process_documents(service, start_time, doc_db, target_id=None, target_type=N
                                 text = f"Unsupported format: {mime_type} for file {file_name}"
                             
                             # Compute checksum to check if content actually changed
-                            checksum = compute_checksum(text)
+                            current_checksum = compute_checksum(text)
+                            last_checksum = doc_db["documents"][file_id]["checksum"] if file_id in doc_db["documents"] else None
                             
                             # Check if we have this file already and if the content has changed
                             if (file_id not in doc_db["documents"] or 
-                                doc_db["documents"][file_id]["checksum"] != checksum):
+                                last_checksum != current_checksum):
+
+                                # If the file is new, we need to add it to the database
                                 
                                 # Store the document in our database
                                 doc_db["documents"][file_id] = {
                                     "name": file_name,
                                     "url": item.get("webViewLink", "N/A"),
+                                    "description": item.get("description", ""),
+                                    "parents": item.get("parents", []),
                                     "mimeType": mime_type,
-                                    "modifiedTime": item['modifiedTime'],
+                                    "owners": item.get("owners", []),
                                     "createdTime": item['createdTime'],
+                                    "lastModifyingUser": item.get("lastModifyingUser", {}),
+                                    "modifiedTime": item['modifiedTime'],
                                     "lastSynced": current_time,
-                                    "checksum": checksum,
+                                    "checksum": current_checksum,
                                     "content": text
                                 }
                                 files_updated += 1
@@ -541,7 +550,7 @@ def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output
 
 #region Multithreaded Subfolder Scanning
 def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, throttle_delay=0.05, 
-                                    batch_size=5, throttle_strategy="adaptive", output_folder_path=None):
+                                    batch_size=5, throttle_strategy="adaptive", output_folder_path=None, structure=False):
     """
     Get all subfolders using optimized multithreading.
     
@@ -838,6 +847,9 @@ def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, thr
     # Save the subfolder structure to an Excel file
     output_file = os.path.join(output_folder_path, "subfolder_structure.xlsx")
     save_folder_structure_to_excel(all_subfolders, output_file)
+
+    if structure:
+        os._exit(0)
     
     return all_subfolders
 

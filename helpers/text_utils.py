@@ -190,5 +190,29 @@ def extract_text_from_docx(docx_bytes, file_url: Optional[str] = None):
     output.append("## CONTENT ##")
     output.append(content)
     output.append("## END CONTENT ##")
+
+    metadata = {
+        # Initialize core properties with None
+        "title": None,
+        "author": None,
+        "subject": None,
+        "keywords": None,
+        "created_date": None,
+        "last_modified_date": None,
+        "revision": None,
+    }
+    # Attempt to extract core properties
+    core_properties = doc.core_properties
+    metadata.update({
+        "title": core_properties.title if core_properties.title else None,
+        "author": core_properties.author if core_properties.author else None,
+        "subject": core_properties.subject if core_properties.subject else None,
+        "keywords": core_properties.keywords if core_properties.keywords else None,
+    })
+    
+    output_data = {
+        "content": content,
+        "metadata": metadata
+    }
     
     return "\n".join(output)

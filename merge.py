@@ -21,9 +21,11 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Your application description")
     parser.add_argument("--no-update", action="store_true", 
                         help="Skip update check and run the application directly")
+    parser.add_argument("--structure-only", action="store_true", 
+                        help="Transcribe the synced content folder structure into an excel file")
     return parser.parse_args()
 
-def main():
+def main(args):
     """
     Main function to run the sync process.
     Allows user to provide a Drive URL either as a command line argument
@@ -41,25 +43,22 @@ def main():
         output_folder_name = None
         output_folder_path = None
         url = None
+
+        if args.structure_only:
+            print("The process will only output the folder structure to an excel file.")
         
-        # Check for command line arguments
-        if len(sys.argv) > 1:
-            url = sys.argv[1]
-            logging.info(f"URL provided via command line: {url}")
+
+        print("Please paste a Google Drive URL to sync:")
+        user_input = input(f"{BOLD_CYAN}> {RESET}").strip()
+        
+        if user_input:
+            url = user_input
+            print(f"\nProcessing Drive URL: {YELLOW}{url}{RESET}")
+            logging.info(f"URL provided via user input: {url}")
         else:
-            # If no URL provided as argument, prompt the user
-            print(f"\n{YELLOW}No Google Drive URL provided as argument.{RESET}")
-            print("Please paste a Google Drive URL to sync:")
-            user_input = input(f"{BOLD_CYAN}> {RESET}").strip()
-            
-            if user_input:
-                url = user_input
-                print(f"\nProcessing Drive URL: {YELLOW}{url}{RESET}")
-                logging.info(f"URL provided via user input: {url}")
-            else:
-                url = "https://drive.google.com/drive/u/0/my-drive"
-                print(f"\n{YELLOW}No URL provided. Syncing your entire personal Drive.{RESET}")
-                logging.info("No URL provided. Syncing entire personal Drive from default drive url.")
+            url = "https://drive.google.com/drive/u/0/my-drive"
+            print(f"\n{YELLOW}No URL provided. Syncing your entire personal Drive.{RESET}")
+            logging.info("No URL provided. Syncing entire personal Drive from default drive url.")
 
         # Process the URL if one was provided
         if url:
@@ -98,7 +97,8 @@ def main():
             doc_db = process_documents(service, last_sync_time, doc_db, 
                                      target_id, target_type, 
                                      output_folder_path=output_folder_path, 
-                                     output_folder_name=output_folder_name)
+                                     output_folder_name=output_folder_name,
+                                     structure=args.structure_only)
 
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Process interrupted by user. Exiting...{RESET}")
@@ -138,7 +138,7 @@ if __name__ == '__main__':
             print("Continuing with current version...")
 
     try:
-        main()
+        main(args)
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Process interrupted by user. Exiting...{RESET}")
         sys.exit(0)
