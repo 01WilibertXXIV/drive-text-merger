@@ -1,901 +1,390 @@
-import os
-import json
-import time
-import datetime
-from googleapiclient.http import MediaIoBaseDownload
-import io
-import googleapiclient
 import logging
 import time
-import threading
-from queue import Queue, Empty
-import subprocess
-import marqo
-from helpers.marqo_utils import MarqoDocumentManager
-from constants.colors import RESET, BOLD_CYAN, YELLOW, GREEN, DARK_GRAY, RED
-from constants.app_data import DATA_FOLDER, DOCUMENT_DB_FILE, APP_NAME  
-from constants.time_data import START_TIME, START_TIME_STRING
+import datetime
+from typing import Set, Dict, Any, Optional
 
-from helpers.drive_utils import get_name_for_id
-from helpers.sync_utils import save_last_sync_time, compute_checksum
-from helpers.text_utils import extract_text_from_docx, extract_text_from_pdf
-from helpers.sheet_utils import extract_complete_sheet_text
-from helpers.messages.outro import print_outro
+# Import components from your refactored structure
+from config import DEFAULT_START_TIME, QUERY_MIME_TYPES, PAGE_SIZE, DRIVE_FIELDS
 
-from helpers.vectors.chunking_utils import chunk_text_recursive as chunk_document_text
+from constants.colors import RESET, BOLD_CYAN, YELLOW, GREEN, DARK_GRAY, RED # Keep colors if desired
+from src.drive import api_utils as drive_api
+from src.drive import scanner as drive_scanner
+from src.processing import chunker, checksum, extractor
+from src.processing.document import ProcessedDocument # Assuming you use the dataclass
+from src.storage.local_db import LocalDBManager
+from src.storage.vector_store import MarqoManager
+from utils import time_utils
+from src.reporting import merged_file, stats # If generating report here
 
-from helpers.vector_store_marqo_utils import (
-    upsert_document_marqo as upsert_document_to_vector_store,
-    delete_document_marqo as delete_document_from_vector_store,
-    setup_marqo_index as setup_vector_store
-)
-
-# Set up logging
-logging.basicConfig(filename='drive_sync.log', level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# Assume START_TIME and START_TIME_STRING are defined globally or passed if needed for stats
+# Example: START_TIME = time.time()
+# START_TIME_STRING = datetime.datetime.now()
 
 
-def ensure_data_folder(output_folder_path):
-    """Ensure the data folder exists and is hidden on Windows."""
-    data_folder_path = os.path.join(output_folder_path, DATA_FOLDER)
-    
-    if not os.path.exists(data_folder_path):
-        os.makedirs(data_folder_path)
-        
-        # Hide the folder on Windows
-        if os.name == "nt":
-            subprocess.call(["attrib", "+H", data_folder_path])
-
-def load_document_database(output_folder_path):
-    """Load the document database from file."""
-    ensure_data_folder(output_folder_path)  # Ensure the folder exists and is hidden
-    
-    db_file_path = os.path.join(output_folder_path, DATA_FOLDER, DOCUMENT_DB_FILE)
-    
-    if os.path.exists(db_file_path):
-        with open(db_file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    
-    return {"documents": {}, "metadata": {"last_updated": ""}}
-
-def save_document_database(db, output_folder_path):
-    """Save the document database to file."""
-    with open(os.path.join(f"{output_folder_path}/{DATA_FOLDER}/{DOCUMENT_DB_FILE}"), 'w', encoding='utf-8') as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-
-def save_to_vector_store(db):
-    
-    marqo_client = marqo.Client(url="http://gk4k0ckgck04g04ow8w08wws.100.71.51.35.sslip.io/")
-    marqo_client = MarqoDocumentManager(marqo_client, "documents")
-
-
-#region Process Documents
-def process_documents(service, start_time, doc_db, target_id=None, target_type=None, output_folder_path=None, output_folder_name=None):
+def process_drive_documents(
+    service: Any,  # Google Drive service object
+    local_db_manager: LocalDBManager,
+    marqo_manager: MarqoManager,
+    output_folder_path: str,
+    output_folder_name: Optional[str] = None, # For merged file generation
+    target_id: Optional[str] = None,
+    target_type: Optional[str] = None # e.g., 'folder', 'drive'
+) -> Dict[str, Any]:
     """
-    Enhanced process_documents to recursively search through all subfolders
-    """
-    # Get list of all changes since the last sync
-    changes_processed = 0
-    files_updated = 0
-    files_deleted = 0
-    total_download_bandwidth = 0
-    
-    # Track the current time for the next sync point
-    current_time = datetime.datetime.now(datetime.UTC).isoformat() + 'Z'
-    index_name = "documents"
-    client = setup_vector_store(index_name)
+    Orchestrates the Google Drive document synchronization process.
 
-    print()
-    if(start_time == "1970-01-01T00:00:00.000Z"):
-        print(f"First time running this script, building database from scratch. \nThis may take a while...")
+    Args:
+        service: Authenticated Google Drive API service instance.
+        local_db_manager: Instance managing the local JSON database.
+        marqo_manager: Instance managing the Marqo vector store connection.
+        output_folder_path: Path to the main output/data directory.
+        output_folder_name: Base name for the generated merged file(s).
+        target_id: Optional ID of a specific folder or drive ('root' for My Drive).
+        target_type: Type of the target_id ('folder' or 'drive').
+
+    Returns:
+        A dictionary containing synchronization statistics.
+    """
+    sync_start_time = time.time()
+    sync_start_time_str = time_utils.get_current_utc_iso_string()
+    last_sync_time_str = local_db_manager.load_last_sync_time()
+
+    # --- Initialization ---
+    logging.info(f"Starting Drive sync process. Target: {target_id or 'All'}")
+    print("\nStarting Document Synchronization...")
+
+    if last_sync_time_str == DEFAULT_START_TIME:
+        print(f"First sync or last sync time missing. Scanning all documents.")
+        logging.info("Performing initial full scan.")
     else:
         try:
-            # Handle different possible time string formats
-            if 'Z' in start_time and '+' in start_time:
-                # If we have both Z and +00:00, remove the Z as it's redundant
-                start_time = start_time.replace('Z', '')
-                # Parse with the +00:00 timezone format
-                utc_time = datetime.datetime.fromisoformat(start_time)
-            elif 'Z' in start_time:
-                # Format like "2023-01-01T12:00:00.000Z"
-                utc_time = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S.%fZ")
-            elif '+' in start_time or '-' in start_time[10:]:  # Check for timezone marker after date
-                # Format like "2023-01-01T12:00:00.000+00:00"
-                utc_time = datetime.datetime.fromisoformat(start_time)
-            else:
-                # Assume UTC if no timezone specified
-                utc_time = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S.%f")
-                utc_time = utc_time.replace(tzinfo=datetime.timezone.utc)
-            
-            # Convert to local timezone
-            local_time = utc_time.astimezone(tz=None)
-            
-            # Format for display (includes date and time with timezone info)
-            formatted_local_time = local_time.strftime("%Y-%m-%d %H:%M:%S %Z")
-            
-            logging.info(f"Starting sync from {start_time} (UTC)")
-            logging.info(f"Local time: {formatted_local_time}")
-            
-            print(f"Starting sync from: {YELLOW}{formatted_local_time}{RESET}")
+            # Attempt to parse and display the last sync time nicely
+            last_sync_dt = time_utils.parse_iso_time_string(last_sync_time_str)
+            formatted_local_time = time_utils.format_time_local(last_sync_dt)
+            print(f"Syncing changes since: {YELLOW}{formatted_local_time}{RESET}")
+            logging.info(f"Starting sync from {last_sync_time_str} (UTC)")
         except (ValueError, TypeError) as e:
-            # Handle case where the string format is different than expected
-            logging.warning(f"Could not parse time string '{start_time}': {e}")
-            print(f"Starting sync from last sync time: {YELLOW}{start_time}{RESET}")
-            print(f"{YELLOW}Note:{RESET} Time format could not be converted to local timezone")
+            logging.warning(f"Could not parse last sync time '{last_sync_time_str}': {e}. Syncing from stored value.")
+            print(f"Syncing changes since: {YELLOW}{last_sync_time_str}{RESET}")
+            print(f"{YELLOW}Note:{RESET} Time format could not be converted to local timezone.")
     print()
 
+    files_processed_count = 0
+    files_updated_count = 0
+    files_deleted_count = 0
+    total_download_bandwidth = 0
+    active_file_ids: Set[str] = set()
+    errors_encountered = 0
+
+    # --- Determine Folders to Scan ---
+    folder_ids_to_search = []
+    scan_entire_scope = not target_id # Assume full scan unless target is specified
+
     if target_id:
-        logging.info(f"Target {target_type} ID: {target_id}")
-     
-    # Get all docs that have been trashed/deleted since last sync
-    existing_file_ids = set(doc_db["documents"].keys())
-    active_file_ids = set()
-    
-    # Prepare list of folder IDs to search
-    folder_ids_to_search = [target_id]
-    
-    # If a specific folder is targeted, get all its subfolders
-    if target_id and target_type == 'folder':
-        subfolders = get_all_subfolders_multithreaded(
-            service, 
-            target_id, 
-            max_workers=8, 
-            throttle_delay=0.1,
-            batch_size=5,
-            throttle_strategy="adaptive"
-            )
-        folder_ids_to_search.extend([folder['id'] for folder in subfolders])
-        
-        logging.info(f"Found {len(subfolders)} subfolders")
-        #print(f"Found {len(subfolders)} subfolders")
-    
-    try:
+        # Handle specific targets like 'my-drive' aliases
+        if target_id in ["my-drive", "u/0/my-drive"]:
+             target_id = "root"
+             target_type = 'drive' # Assume it's the root drive
 
-        subfolders_count = 1
-        # Process each folder
-        for search_folder_id in folder_ids_to_search:
-
-            if search_folder_id == "my-drive" or search_folder_id == "u/0/my-drive":
-                search_folder_id = "root"
-
-
-            logging.info(f"Searching in folder: {search_folder_id}")
-            #print(f"({subfolders_count}/{len(folder_ids_to_search)}) | Searching in folder: {search_folder_id}")
-            
-            # Construct query for this folder
-            query = (
-                "(mimeType='application/vnd.google-apps.document' OR "
-                "mimeType='application/pdf' OR "
-                "mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' OR "
-                "mimeType='application/vnd.google-apps.spreadsheet' OR "
-                "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' OR "
-                "mimeType='text/csv') "
-                "and not name contains '.docm' "
-                f"and '{search_folder_id}' in parents"
-            )
-
-            page_token = None
-            while True:
-                list_params = {
-                    'q': query,
-                    'pageSize': 100,
-                    'fields': "nextPageToken, files(id, name, mimeType, modifiedTime, createdTime, webViewLink)",
-                    'spaces': 'drive',
-                    'supportsAllDrives': True,
-                    'includeItemsFromAllDrives': True
-                }
-                
-                if page_token:
-                    list_params['pageToken'] = page_token
-                
-                try:
-                    results = service.files().list(**list_params).execute()
-                except Exception as api_error:
-                    logging.error(f"Google Drive API error listing files in {search_folder_id}: {api_error}", exc_info=True)
-                    print(f"{RED}API Error listing files in {search_folder_id}. Skipping folder.{RESET}")
-                    break # Skip to next folder on error
-
-                folder_name = get_name_for_id(service, file_id=search_folder_id)
-                print(f"\n({BOLD_CYAN}{subfolders_count}{RESET}/{len(folder_ids_to_search)}) - Searching in {BOLD_CYAN}{folder_name}{RESET}                    ")
-                
-                items = results.get('files', [])
-                logging.info(f"Found {len(items)} files in {folder_name}")
-
-                if not items:
-                    print(f"  {DARK_GRAY}No relevant files found in this folder.{RESET}")
-                else:
-                    print(f"  Found {YELLOW}{len(items)}{RESET} relevant files.")
-
-                processed_files_count = 0
-                files_to_process = len(items)
-
-                for item in items:
-                    file_id = item['id']
-                    file_name = item['name']
-                    mime_type = item['mimeType']
-                    modified_time_str = item['modifiedTime']
-
-                    active_file_ids.add(file_id)
-
-                    # Check if file needs processing (new or modified)
-                    should_process = (file_id not in doc_db.get("documents", {}) or
-                                       modified_time_str > doc_db.get("documents", {}).get(file_id, {}).get("modifiedTime", "1970-01-01T00:00:00.000Z"))
-
-                    if should_process:
-                        changes_processed += 1
-                        print(f"  ↳ {YELLOW}{file_name}{RESET} - Processing...", end="", flush=True)
-                        try:
-                            # --- Download File Content (Modified for clarity) ---
-                            request = None
-                            export_mime_type = None # Track what we actually download
-
-                            if mime_type == 'application/vnd.google-apps.document':
-                                export_mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                                request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-                            elif mime_type == 'application/vnd.google-apps.spreadsheet':
-                                export_mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                                request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-                            elif mime_type in ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                                                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv']:
-                                export_mime_type = mime_type # It's already in a downloadable format
-                                request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                            else:
-                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}Unsupported native type ({mime_type}). Skipping.{RESET}        ")
-                                logging.warning(f"Skipping file {file_name} ({file_id}) due to unsupported native mimeType: {mime_type}")
-                                continue # Skip to next file
-
-                            file_data = io.BytesIO()
-                            downloader = MediaIoBaseDownload(file_data, request)
-                            done = False
-                            while not done:
-                                status, done = downloader.next_chunk()
-                                if status:
-                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - Downloading {int(status.progress() * 100)}%...", end="", flush=True)
-
-                            file_content_bytes = file_data.getvalue()
-                            file_data_size = len(file_content_bytes)
-                            total_download_bandwidth += file_data_size
-                            logging.info(f"Downloaded {file_data_size} bytes for {file_name} ({file_id}) as {export_mime_type}")
-
-                            # --- Extract Text ---
-                            text = None
-                            file_url = item.get("webViewLink", "N/A")
-
-                            # Use the EXPORTED mime type to decide extraction method
-                            if export_mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                                text = extract_text_from_docx(file_content_bytes, file_url)
-                            elif export_mime_type == 'application/pdf':
-                                text = extract_text_from_pdf(file_content_bytes, file_url)
-                                if text is None: text = f"[PDF text extraction failed. View file at {file_url}]"
-                            elif export_mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv']:
-                                text = extract_complete_sheet_text(file_content_bytes, file_name, file_url)
-                            else:
-                                text = f"[Unsupported format for text extraction: {export_mime_type}]"
-                                logging.warning(f"No text extraction method for downloaded type {export_mime_type} from file {file_name}")
-
-                            if not text:
-                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Failed to extract text.{RESET}                             ")
-                                logging.error(f"Text extraction resulted in empty content for {file_name} ({file_id})")
-                                continue # Skip if text extraction fails
-
-                            # --- Compute Checksum ---
-                            checksum = compute_checksum(text)
-
-                            # --- Check if Content *Actually* Changed ---
-                            if (file_id not in doc_db.get("documents", {}) or
-                                doc_db.get("documents", {}).get(file_id, {}).get("checksum") != checksum):
-
-                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Content changed. Updating...{RESET}                ", end="", flush=True)
-
-                                # --- Chunk Document ---
-                                chunks = chunk_document_text(text)
-                                logging.info(f"Chunked '{file_name}' into {len(chunks)} chunks.")
-
-                                # --- Prepare Metadata for Vector Store ---
-                                vector_store_metadata = {
-                                    "file_name": file_name,
-                                    "url": file_url,
-                                    "mime_type": mime_type, # Store original mime type
-                                    "modified_time": modified_time_str,
-                                    "created_time": item['createdTime'],
-                                    # Add any other relevant metadata from 'item' or elsewhere
-                                }
-
-                                # --- Upsert to Vector Store ---
-                                try:
-                                    print(f"Upserting {file_name} ({file_id}) to vector store with index name: {index_name}")
-                                    upsert_document_to_vector_store(
-                                        vector_store_client=client,
-                                        index_name=index_name,
-                                        file_id=file_id,
-                                        chunks=chunks,
-                                        metadata=vector_store_metadata
-                                    )
-                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated & Stored in Vector DB!{RESET}        ")
-                                    files_updated += 1 # Count as updated only if vector store succeeds? Your choice.
-
-                                except Exception as vs_error:
-                                    logging.error(f"Failed to upsert {file_name} ({file_id}) to vector store: {vs_error}", exc_info=True)
-                                    # Decide if failure to update vector store should halt the process or just be logged
-                                    print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Updated Locally, Vector DB FAILED!{RESET}    ")
-                                    # Potentially skip adding to doc_db or flag it? For now, we proceed to update doc_db.
-
-                                # --- Update Local Document Database (doc_db) ---
-                                if "documents" not in doc_db: doc_db["documents"] = {}
-                                doc_db["documents"][file_id] = {
-                                    "name": file_name,
-                                    "url": file_url,
-                                    "mimeType": mime_type,
-                                    "modifiedTime": modified_time_str,
-                                    "createdTime": item['createdTime'],
-                                    "lastSynced": current_time,
-                                    "checksum": checksum,
-                                    "content": text, # Keep full text locally, or remove if only needed for chunking
-                                    "deleted": False # Explicitly mark as not deleted
-                                }
-                                # files_updated += 1 # Moved this up to after successful vector store update
-
-                            else:
-                                # Checksum is the same, content hasn't changed
-                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}No content change detected. Updated sync time.{RESET} ")
-                                # Update lastSynced time and URL in local DB even if content is the same
-                                if file_id in doc_db.get("documents", {}):
-                                    doc_db["documents"][file_id]["lastSynced"] = current_time
-                                    doc_db["documents"][file_id]["url"] = file_url # URL might change
-
-
-                        except googleapiclient.errors.HttpError as download_error:
-                             # Specific check for permissions or download issues
-                             error_content = download_error.resp.get('content', b'').decode('utf-8')
-                             if "fileNotDownloadable" in error_content or "cannotDownloadAbusiveFile" in error_content:
-                                 print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: File not downloadable (Permission/Policy).{RESET} ")
-                                 logging.warning(f"Cannot download file {file_name} ({file_id}): {error_content}")
-                             else:
-                                 print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Download Error: {download_error}{RESET} ")
-                                 logging.error(f"Error downloading {file_name} ({file_id}): {download_error}", exc_info=True)
-                        except Exception as e:
-                            logging.error(f"Error processing file {file_name} ({file_id}): {str(e)}", exc_info=True)
-                            print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Error: {str(e)}{RESET}         ")
-
-                    else:
-                        # File exists and modifiedTime is not newer than last sync
-                        print(f"  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}No changes detected. Skipping.{RESET}")
-                        # Important: Still add to active_file_ids even if skipped
-                        active_file_ids.add(file_id)
-                        # Optionally update lastSynced time? Maybe not necessary if modifiedTime hasn't changed.
-                        if file_id in doc_db.get("documents", {}):
-                             doc_db["documents"][file_id]["lastSynced"] = current_time # Keep sync time fresh
-
-
-                page_token = results.get('nextPageToken')
-                if not page_token:
-                    break # Exit while loop for the current folder
-
-            # Progress indication (optional)
-            elapsed_time = time.time() - START_TIME
-            progress_percentage = (subfolders_count / len(folder_ids_to_search)) * 100
-            # Add your progress bar logic here if desired
-            # print(f'\rProgress: {progress_percentage:.1f}% | Elapsed: {elapsed_time:.2f}s', end='', flush=True)
-
-            subfolders_count += 1
-            time.sleep(0.1) # Small delay between folders to avoid hitting rate limits aggressively
-
-        print("\n") # Newline after folder processing
-
-        # --- Handle Deleted Files ---
-        # Compare files seen in this run (active_file_ids) vs files in DB (existing_file_ids)
-        # Only perform deletion check if we scanned the whole intended scope (e.g., not targeting a specific subfolder run)
-        # This logic might need refinement depending on whether a run targets a subset or the whole corpus
-        # For simplicity, let's assume if target_id wasn't specified, we scanned everything relevant
-        if not target_id: # Only check for deletions if doing a full scan (adjust as needed)
-             deleted_file_ids = existing_file_ids - active_file_ids
-             if deleted_file_ids:
-                print(f"Checking {len(deleted_file_ids)} potentially deleted files...")
-             for file_id in deleted_file_ids:
-                 if file_id in doc_db.get("documents", {}):
-                     # Check if it wasn't already marked as deleted
-                     if not doc_db["documents"][file_id].get("deleted", False):
-                         file_name = doc_db["documents"][file_id].get("name", "Unknown Name")
-                         print(f"File deleted or moved: {YELLOW}{file_name}{RESET} ({file_id})")
-                         logging.info(f"Marking file as deleted: {file_name} ({file_id})")
-
-                         # Mark as deleted in local DB
-                         doc_db["documents"][file_id]["deleted"] = True
-                         doc_db["documents"][file_id]["deletedTime"] = current_time
-                         files_deleted += 1
-
-                         # --- Delete from Vector Store ---
-                         try:
-                             delete_document_from_vector_store(
-                                 vector_store_client=client,
-                                 index_name=index_name,
-                                 file_id=file_id
-                             )
-                             logging.info(f"Deleted chunks for file {file_id} from vector store.")
-                         except Exception as vs_del_error:
-                              logging.error(f"Failed to delete file {file_id} from vector store: {vs_del_error}", exc_info=True)
-                              print(f"{RED}Failed to delete {file_name} from vector store.{RESET}")
-        else:
-            logging.info(f"Target ID ({target_id}) was specified. Skipping deletion check for files outside this target.")
-            print(f"{DARK_GRAY}Target specified, skipping deletion check for files outside the target scope.{RESET}")
-
-
-    except Exception as e:
-        logging.error(f"Critical error during sync process: {str(e)}", exc_info=True)
-        print(f"{RED}Critical error in sync process: {str(e)}{RESET}")
-
-    # --- Finalize and Save ---
-    # Update the database metadata
-    if "metadata" not in doc_db: doc_db["metadata"] = {} # Initialize if first run
-    doc_db["metadata"]["last_updated"] = current_time
-    doc_db["metadata"]["total_documents"] = len(doc_db.get("documents", {}))
-    doc_db["metadata"]["active_documents"] = len([
-        doc_id for doc_id, doc in doc_db.get("documents", {}).items() if not doc.get("deleted", False)
-    ])
-
-    # Save the document database (contains metadata and potentially full text)
-    if output_folder_path:
-        save_document_database(doc_db, output_folder_path)
-
-    # Generate the merged file (if still needed)
-    if output_folder_path and output_folder_name:
-        generate_merged_file(doc_db, current_time, files_updated, files_deleted, output_folder_path, output_folder_name, total_download_bandwidth)
-
-    # Update the last sync time
-    if output_folder_path:
-        save_last_sync_time(current_time, output_folder_path)
-
-    logging.info(f"Sync completed. Processed {changes_processed} potential changes, updated {files_updated} files, marked {files_deleted} as deleted.")
-    # Add timing summary if needed
-
-    print(f"\nSync Summary:")
-    print(f"  Files Updated/Added: {GREEN}{files_updated}{RESET}")
-    print(f"  Files Deleted/Moved: {YELLOW}{files_deleted}{RESET}")
-    # print(f"  Total Download: {total_download_bandwidth / (1024*1024):.2f} MB") # Example stat
-
-    return doc_db
-
-#endregion
-
-
-#region Generate Merged File
-def generate_merged_file(doc_db, timestamp, files_updated, files_deleted, output_folder_path=None, output_folder_name=None, total_download_bandwidth=0):
-    """
-    Generate merged files with all active documents, limiting each file to 200MB OR 400,000 words,
-    whichever comes first.
-    """
-    timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    
-    # Maximum file size (200MB in bytes) and word count (400,000 words)
-    MAX_FILE_SIZE = 200 * 1024 * 1024
-    MAX_WORD_COUNT = 400000
-    
-    # List to keep track of all generated files
-    generated_files = []
-    # Dictionary to track file sizes
-    file_sizes = {}
-    # Dictionary to track word counts
-    file_word_counts = {}
-    # Variables to track totals
-    total_size = 0
-    total_word_count = 0
-
-    duration = datetime.datetime.now() - START_TIME_STRING
-    hours, remainder = divmod(int(duration.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    
-    # Prepare header content
-    header = f"Sync Completed - Generated on {timestamp}\n"
-    header += f"Operation took {hours:02d}:{minutes:02d}:{seconds:02d}\n\n"
-    header += f"Total documents: {doc_db['metadata']['total_documents']}\n"
-    header += f"Active documents: {doc_db['metadata']['active_documents']}\n"
-    header += f"Files updated in this sync: {files_updated}\n"
-    header += f"Files deleted in this sync: {files_deleted}\n"
-    
-    # Initialize variables
-    current_file = None
-    current_file_path = None
-    current_file_size = 0
-    current_word_count = 0
-    file_index = 1
-    
-    # Count header words
-    header_word_count = len(header.split())
-
-    current_file_name = f"{timestamp_str}_{output_folder_name}_part{file_index}.md"
-    
-    # Create the first file in the specified output folder path
-    current_file_path = os.path.join(output_folder_path, current_file_name)
-    current_file = open(current_file_path, 'w', encoding='utf-8')
-    current_file.write(header)
-    current_file_size = len(header.encode('utf-8'))
-    current_word_count = header_word_count
-    generated_files.append(current_file_path)
-
-    index = 1
-
-    # Write all active documents
-    for file_id, doc_info in doc_db["documents"].items():
-        # Skip deleted documents
-        if doc_info.get("deleted", False):
-            continue
-            
-        # Prepare document content
-        doc_header = f"## METADATA ##\n"
-        doc_header += f"Title: {doc_info['name']}\n"
-        doc_header += f"URL: {doc_info['url']}\n"
-        doc_header += f"Last Modified: {doc_info['modifiedTime']}\n"
-        doc_content = doc_info["content"]
-        
-        # Calculate size of this document
-        doc_size = len((doc_header + doc_content).encode('utf-8'))
-        doc_word_count = len(doc_content.split())
-        doc_header_word_count = len(doc_header.split())
-        total_doc_word_count = doc_word_count + doc_header_word_count
-        
-        # Check if adding this document would exceed either limit
-        if (current_file_size + doc_size > MAX_FILE_SIZE or 
-            current_word_count + total_doc_word_count > MAX_WORD_COUNT):
-            # Store final size and word count of current file before closing
-            file_sizes[current_file_path] = current_file_size
-            file_word_counts[current_file_path] = current_word_count
-            total_size += current_file_size
-            total_word_count += current_word_count
-            
-            # Close current file
-            current_file.close()
-            
-            # Log which limit was reached
-            if current_file_size + doc_size > MAX_FILE_SIZE:
-                limit_reason = "file size limit (200MB)"
-            else:
-                limit_reason = f"word count limit ({MAX_WORD_COUNT} words)"
-            
-            logging.info(f"Reached {limit_reason} for {current_file_path}")
-            
-            # Create a new file
-            file_index += 1
-            document_part_name = f"{timestamp_str}_{output_folder_name}_part{file_index}.md" 
-            current_file_path = os.path.join(output_folder_path, document_part_name)
-            current_file = open(current_file_path, 'w', encoding='utf-8')
-            
-            # Write header to the new file
-            current_file.write(header)
-            current_file_size = len(header.encode('utf-8'))
-            current_word_count = header_word_count
-            generated_files.append(current_file_path)
-            
-            logging.info(f"Created new file: {current_file_path}")
-            print(f"Created new file: {current_file_path}")
-        
-        # Write document to current file
-        current_file.write(f"\n```START OF FILE {index} ```\n")
-        current_file.write(doc_header)
-        current_file.write(doc_content)
-        current_file.write(f"\n```END OF FILE {index} ```\n")
-
-        index += 1
-        
-        # Update current file size and word count
-        current_file_size += doc_size
-        current_word_count += total_doc_word_count
-    
-    # Add the last file's size and word count to our tracking
-    file_sizes[current_file_path] = current_file_size
-    file_word_counts[current_file_path] = current_word_count
-    total_size += current_file_size
-    total_word_count += current_word_count
-    
-    # Close the last file
-    current_file.close()
-    
-    # Log details about all generated files and total size
-    logging.info(f"Generated {len(generated_files)} merged files: {', '.join(generated_files)}")
-    
-
-    print_outro(output_folder_path, file_sizes, file_word_counts, total_size, total_word_count, hours, minutes, seconds, total_download_bandwidth)
-
-    return generated_files
-#endregion
-
-
-
-#region Multithreaded Subfolder Scanning
-def get_all_subfolders_multithreaded(service, root_folder_id, max_workers=8, throttle_delay=0.05, 
-                                    batch_size=5, throttle_strategy="adaptive"):
-    """
-    Get all subfolders using optimized multithreading.
-    
-    Args:
-        service: Google Drive service object
-        root_folder_id: ID of the root folder to scan
-        max_workers: Maximum number of threads to use (default: 8)
-        throttle_delay: Base delay between API calls in seconds (default: 0.05)
-        batch_size: Number of folders each thread processes before yielding (default: 5)
-        throttle_strategy: Strategy for throttling - "fixed", "adaptive", or "none" (default: "adaptive")
-    
-    Returns:
-        List of dictionaries containing folder details
-    """
-    # Shared variables across threads
-    subfolder_counter = {'count': 0}
-    error_counter = {'count': 0}
-    counter_lock = threading.Lock()
-    error_lock = threading.Lock()
-    all_subfolders = []
-    all_subfolders_lock = threading.Lock()
-    start_time = time.time()
-    
-    # Adaptive throttling variables
-    current_delay = throttle_delay
-    min_delay = 0.01
-    max_delay = 0.5
-    delay_lock = threading.Lock()
-    last_error_time = 0
-    
-    # Thread-safe API call limiter
-    api_lock = threading.RLock()  # Reentrant lock
-    
-    # Use a thread-safe set to track processed folders
-    processed_folders = set()
-    processed_folders_lock = threading.Lock()
-    
-    # Add root folder to processed set
-    processed_folders.add(root_folder_id)
-    
-    # Create a thread-safe queue for pending folders
-    folder_queue = Queue()
-    folder_queue.put((root_folder_id, ''))  # (folder_id, parent_path)
-    
-    # Flag to signal threads to exit
-    shutdown_flag = threading.Event()
-    
-    # Cap the max workers to a reasonable number
-    max_workers = min(max_workers, 15)  # Cap at 15 threads max
-    print(f"Starting scan with {max_workers} worker threads and {throttle_strategy} throttling (base delay: {throttle_delay}s)...")
-    
-    # Progress output thread
-    def progress_reporter():
-        last_count = 0
-        last_update_time = time.time()
-        no_progress_timer = 0
-        last_stats_time = time.time()
-        scan_speed = 0
-        
-        while not shutdown_flag.is_set():
-            elapsed_time = time.time() - start_time
-            hours, remainder = divmod(int(elapsed_time), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            
-            with counter_lock:
-                count = subfolder_counter['count']
-            
-            with error_lock:
-                errors = error_counter['count']
-            
-            # Calculate scanning speed (folders per second)
-            time_diff = time.time() - last_stats_time
-            if time_diff >= 5:  # Update speed stats every 5 seconds
-                count_diff = count - last_count
-                scan_speed = count_diff / time_diff if time_diff > 0 else 0
-                last_count = count
-                last_stats_time = time.time()
-            
-            # Check if we're making progress for stall detection
-            if count > last_count:
-                last_update_time = time.time()
-                no_progress_timer = 0
-            else:
-                no_progress_timer = time.time() - last_update_time
-            
-            # Get current throttle delay
-            with delay_lock:
-                delay = current_delay
-                
-            # Build status message
-            queue_size = folder_queue.qsize()
-            status = f"\rFolders: {BOLD_CYAN}{count + 1}{RESET} | Speed: {scan_speed:.1f}/s | Errors: {errors} | "
-            status += f"Time: {hours:02d}:{minutes:02d}:{seconds:02d} | Queue: {queue_size} | Delay: {delay:.3f}s"
-            
-            # Add no-progress indicator if we've been stuck
-            if no_progress_timer > 5:  # 5 seconds without progress
-                status += f" | No progress: {int(no_progress_timer)}s"
-                
-                # If no progress for extended period and queue is empty, we might be done
-                if no_progress_timer > 30 and queue_size == 0:
-                    print(f"\nNo progress for {int(no_progress_timer)} seconds and queue is empty. Process may be complete.")
-                    shutdown_flag.set()  # Signal threads to exit
-                    break
-
-            status += " " * 20
-            
-            print(status, end='', flush=True)
-            time.sleep(0.5)
-    
-    # Start progress reporter thread
-    progress_thread = threading.Thread(target=progress_reporter)
-    progress_thread.daemon = True
-    progress_thread.start()
-    
-    def throttled_api_call(api_func):
-        """Throttle API calls based on strategy"""
-        nonlocal current_delay, last_error_time
-        
-        # Determine if we need throttling
-        if throttle_strategy == "none":
-            return api_func()
-        
-        if throttle_strategy == "adaptive":
-            # Reduce delay gradually over time if no errors
-            with delay_lock:
-                time_since_error = time.time() - last_error_time
-                if time_since_error > 10 and current_delay > min_delay:
-                    current_delay = max(min_delay, current_delay * 0.95)  # Reduce by 5%
-                delay = current_delay
-        else:  # "fixed"
-            delay = throttle_delay
-        
-        # Use API lock with delay
-        with api_lock:
-            # Apply throttling delay
-            time.sleep(delay)
-            
+        logging.info(f"Target specified: ID={target_id}, Type={target_type}")
+        if target_type == 'folder':
+            print(f"Scanning target folder '{BOLD_CYAN}{output_folder_name}{RESET}' and its subfolders...")
             try:
-                result = api_func()
-                return result
+                # Use the refactored multithreaded scanner
+                subfolders = drive_scanner.get_all_subfolders_multithreaded(
+                    service=service,
+                    root_folder_id=target_id,
+                    # Pass config params here: max_workers, throttle_delay, etc.
+                )
+                folder_ids_to_search = [target_id] + [f['id'] for f in subfolders]
+                print(f"Found {len(subfolders)} subfolders.")
+                logging.info(f"Scanning folder {target_id} and {len(subfolders)} subfolders.")
+                scan_entire_scope = False # Only scanning a subset
             except Exception as e:
-                # On error, increase delay if using adaptive strategy
-                if throttle_strategy == "adaptive":
-                    with delay_lock:
-                        last_error_time = time.time()
-                        current_delay = min(max_delay, current_delay * 1.5)  # Increase by 50%
-                
-                with error_lock:
-                    error_counter['count'] += 1
-                
-                raise
-    
-    def process_folder():
-        """Worker function to process folders from the queue"""
-        processed_count = 0
-        
-        while not shutdown_flag.is_set():
-            batch_processed = 0
-            
-            while batch_processed < batch_size and not shutdown_flag.is_set():
-                try:
-                    # Get a folder from the queue with a timeout
-                    try:
-                        folder_id, parent_path = folder_queue.get(timeout=0.5)
-                    except Empty:
-                        # If nothing in queue, break batch processing
-                        break
-                    
-                    # Query to get all subfolders
-                    query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder'"
-                    
-                    try:
-                        page_token = None
-                        while True and not shutdown_flag.is_set():
-                            # Use throttled API call
-                            results = throttled_api_call(lambda: service.files().list(
-                                q=query,
-                                spaces='drive',
-                                fields='nextPageToken, files(id, name, parents)',
-                                pageToken=page_token,
-                                pageSize=100,  # Get more items per request
-                                supportsAllDrives=True,
-                                includeItemsFromAllDrives=True
-                            ).execute())
-                            
-                            subfolders_batch = []
-                            for folder in results.get('files', []):
-                                folder_id = folder['id']
-                                
-                                # Check if we've already processed this folder to avoid cycles
-                                with processed_folders_lock:
-                                    if folder_id in processed_folders:
-                                        continue
-                                    processed_folders.add(folder_id)
-                                
-                                # Construct full path
-                                full_path = f"{parent_path}/{folder['name']}" if parent_path else folder['name']
-                                
-                                # Create folder entry
-                                folder_entry = {
-                                    'id': folder_id,
-                                    'name': folder['name'],
-                                    'path': full_path
-                                }
-                                
-                                # Add to batch
-                                subfolders_batch.append(folder_entry)
-                                
-                                # Add this folder to the queue for processing its subfolders
-                                folder_queue.put((folder_id, full_path))
-                            
-                            # Update shared counters and lists
-                            if subfolders_batch:
-                                with counter_lock:
-                                    subfolder_counter['count'] += len(subfolders_batch)
-                                
-                                with all_subfolders_lock:
-                                    all_subfolders.extend(subfolders_batch)
-                            
-                            page_token = results.get('nextPageToken')
-                            if not page_token:
-                                break
-                    
-                    except Exception as e:
-                        print(f"\nError retrieving subfolders for {folder_id}: {str(e)}")
-                    
-                    # Increment batch counter
-                    batch_processed += 1
-                    processed_count += 1
-                    
-                except Exception as e:
-                    print(f"\nWorker thread error: {str(e)}")
-            
-            # After processing a batch, give other threads a chance
-            if batch_processed > 0:
-                time.sleep(0.001)  # Tiny sleep to yield CPU
-    
-    # List to keep track of our threads
-    worker_threads = []
-    
-    try:
-        # Create and start worker threads
-        for _ in range(max_workers):
-            thread = threading.Thread(target=process_folder)
-            thread.daemon = True
-            thread.start()
-            worker_threads.append(thread)
-        
-        # Main monitoring loop - check if all work is done
-        max_empty_checks = 5
-        empty_check_count = 0
-        
-        while not shutdown_flag.is_set():
-            # Check if queue is empty
-            if folder_queue.empty():
-                empty_check_count += 1
-                # Give threads a chance to add more to the queue
-                time.sleep(0.5)
-                
-                # If queue remained empty for several checks, we're probably done
-                if empty_check_count >= max_empty_checks:
-                    print("\nQueue has been empty for consecutive checks. Process appears complete.")
-                    shutdown_flag.set()
-                    break
-            else:
-                # Reset counter if queue is not empty
-                empty_check_count = 0
-            
-            # If no progress for a while, progress thread will set shutdown flag
-            time.sleep(0.1)
-            
-    except KeyboardInterrupt:
-        print("\nUser interrupted process")
-    finally:
-        # Signal all threads to exit
-        shutdown_flag.set()
-        
-        # Give threads time to finish cleanly
-        for thread in worker_threads:
-            thread.join(timeout=2)
-        
-        # Stop the progress reporter
-        progress_thread.join(timeout=1)
-        print()  # Print newline after completion
-        
-        # Final stats
-        elapsed_time = time.time() - start_time
-        folders_per_second = subfolder_counter['count'] / elapsed_time if elapsed_time > 0 else 0
-        
-        print(f"Scan completed in {elapsed_time:.1f} seconds.")
-        print(f"Found {BOLD_CYAN}{subfolder_counter['count'] + 1}{RESET} subfolders ({folders_per_second:.1f} folders/sec).")
-        print(f"Encountered {error_counter['count']} errors.\n")
-    
-    return all_subfolders
+                 logging.error(f"Failed to scan subfolders for {target_id}: {e}", exc_info=True)
+                 print(f"{RED}Error scanning subfolders for {target_id}. Aborting targeted scan.{RESET}")
+                 return {"error": "Subfolder scanning failed"}
+        else: # Assume it's a drive ID or 'root'
+             folder_ids_to_search = [target_id]
+             print(f"Scanning target '{target_id}'...")
+             logging.info(f"Scanning root/drive: {target_id}")
+             # For a single drive/root target, we might still consider it a "full" scan of that scope
+             scan_entire_scope = True # Let's assume targeting a drive implies checking deletions within it
+    else:
+        # No target specified, scan 'root' (My Drive) and all subfolders
+        print("Scanning 'My Drive' and all subfolders...")
+        try:
+            subfolders = drive_scanner.get_all_subfolders_multithreaded(service=service, root_folder_id='root')
+            folder_ids_to_search = ['root'] + [f['id'] for f in subfolders]
+            print(f"Scanning 'My Drive' and {len(subfolders)} subfolders.")
+            logging.info(f"Scanning 'root' and {len(subfolders)} subfolders found.")
+        except Exception as e:
+            logging.error(f"Failed to scan subfolders for 'root': {e}", exc_info=True)
+            print(f"{RED}Error scanning subfolders in 'My Drive'. Proceeding with 'My Drive' only.{RESET}")
+            folder_ids_to_search = ['root'] # Fallback to just root if scanning fails
 
-#endregion
+    num_folders_total = len(folder_ids_to_search)
+    processed_folder_count = 0
+
+    # Ensure Marqo index exists before processing files
+    if not marqo_manager.ensure_index_exists():
+         print(f"{RED}Failed to ensure Marqo index '{marqo_manager.index_name}' exists. Aborting sync.{RESET}")
+         logging.critical(f"Marqo index '{marqo_manager.index_name}' setup failed. Aborting.")
+         return {"error": "Marqo index setup failed"}
+
+
+    # --- Main Processing Loop ---
+    for folder_id in folder_ids_to_search:
+        processed_folder_count += 1
+        page_token = None
+
+        try:
+            folder_name = drive_api.get_name_for_id(service, folder_id)
+            print(f"\n({BOLD_CYAN}{processed_folder_count}{RESET}/{num_folders_total}) - Scanning Folder: {BOLD_CYAN}{folder_name or folder_id}{RESET}")
+            logging.info(f"Scanning folder: {folder_name} ({folder_id})")
+        except Exception as e:
+            folder_name = folder_id # Fallback
+            print(f"\n({BOLD_CYAN}{processed_folder_count}{RESET}/{num_folders_total}) - Scanning Folder ID: {BOLD_CYAN}{folder_id}{RESET} (Name lookup failed)")
+            logging.warning(f"Failed to get name for folder {folder_id}: {e}")
+
+        folder_file_count = 0
+        while True: # Paginate through files in the current folder
+            try:
+                list_results = drive_api.list_files_in_folder(
+                    service=service,
+                    folder_id=folder_id,
+                    mime_types=QUERY_MIME_TYPES, # Get from config
+                    page_token=page_token,
+                    page_size=PAGE_SIZE, # Get from config
+                    fields=DRIVE_FIELDS # Get from config
+                )
+                items = list_results.get('files', [])
+                page_token = list_results.get('nextPageToken')
+                folder_file_count += len(items)
+
+                if not items and page_token is None and folder_file_count == 0: # Only print if truly empty
+                     print(f"  {DARK_GRAY}No relevant files found in this folder.{RESET}")
+                     break # Exit while loop for this folder
+
+                if not items and page_token is None: # End of files for this folder
+                     break
+
+                if items:
+                     print(f"  Found {YELLOW}{len(items)}{RESET} file(s) on this page.")
+
+            except Exception as api_error:
+                logging.error(f"API error listing files in {folder_name} ({folder_id}): {api_error}", exc_info=True)
+                print(f"  {RED}API Error listing files in {folder_name}. Skipping folder.{RESET}")
+                errors_encountered += 1
+                break # Skip to the next folder
+
+            # --- Process Files in Current Page ---
+            for item in items:
+                file_id = item['id']
+                file_name = item.get('name', 'Untitled')
+                mime_type = item.get('mimeType', 'unknown')
+                modified_time_str = item.get('modifiedTime')
+                created_time_str = item.get('createdTime')
+                file_url = item.get('webViewLink', '')
+
+                active_file_ids.add(file_id)
+                files_processed_count += 1
+
+                print(f"  ↳ {YELLOW}{file_name}{RESET} ({mime_type}) - ", end="")
+
+                # --- Check if Processing Needed ---
+                doc_info = local_db_manager.get_document_info(file_id)
+                local_mod_time = doc_info.get("modifiedTime") if doc_info else None
+
+                # Process if new or modified time is more recent. Handle potential missing modifiedTime.
+                should_process = (not doc_info or not local_mod_time or
+                                 (modified_time_str and modified_time_str > local_mod_time))
+
+                if should_process:
+                    print(f"Processing...", end="", flush=True)
+                    try:
+                        # 1. Download/Export Content
+                        content_bytes, downloaded_mime_type, size = drive_api.download_file_content(
+                            service, file_id, mime_type
+                        )
+                        if content_bytes is None: # Handle download failure reported by the utility
+                             print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Download Failed/Skipped.{RESET}    ")
+                             logging.warning(f"Download failed or skipped for {file_name} ({file_id}).")
+                             errors_encountered += 1
+                             continue # Skip to next file
+                        total_download_bandwidth += size
+                        logging.info(f"Downloaded {size} bytes for {file_name} ({file_id}) as {downloaded_mime_type}")
+
+                        # 2. Extract Text
+                        text = extractor.extract_text(
+                            content_bytes, downloaded_mime_type, file_name, file_url
+                        )
+                        if not text:
+                            print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Text Extraction Failed.{RESET}        ")
+                            logging.error(f"Text extraction failed for {file_name} ({file_id}) type {downloaded_mime_type}")
+                            errors_encountered += 1
+                            # Optionally store a marker in local DB? For now, skip.
+                            continue
+
+                        # 3. Compute Checksum
+                        current_checksum = checksum.compute_checksum(text)
+                        local_checksum = doc_info.get("checksum") if doc_info else None
+
+                        # 4. Check if Content *Actually* Changed
+                        if not local_checksum or current_checksum != local_checksum:
+                            print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Content changed. Updating...{RESET}", end="", flush=True)
+
+                            # 5. Chunk Text
+                            chunks = chunker.chunk_document_text(text) # Use your chunking util
+                            logging.info(f"Chunked '{file_name}' into {len(chunks)} chunks.")
+
+                            # 6. Prepare ProcessedDocument data
+                            processed_doc = ProcessedDocument(
+                                id=file_id,
+                                name=file_name,
+                                url=file_url,
+                                mime_type=mime_type, # Original type
+                                modified_time_str=modified_time_str,
+                                created_time_str=created_time_str,
+                                downloaded_mime_type=downloaded_mime_type,
+                                content=None, # Decide if needed after chunking
+                                checksum=current_checksum,
+                                chunks=chunks
+                            )
+
+                            # 7. Upsert to Vector Store
+                            upsert_success = marqo_manager.upsert_document(processed_doc)
+
+                            # 8. Update Local Document Database
+                            local_db_manager.update_document(processed_doc, sync_start_time_str)
+
+                            if upsert_success:
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {GREEN}Updated & Stored in Vector DB!{RESET}            ")
+                                files_updated_count += 1
+                            else:
+                                print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Updated Locally, Vector DB FAILED!{RESET}    ")
+                                errors_encountered += 1
+                                # Decide if local update should be reverted or flagged
+
+                        else:
+                            # Checksum is the same, content hasn't changed
+                            print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {DARK_GRAY}No content change. Updating sync time.{RESET} ")
+                            # Update only metadata like lastSynced time and potentially URL
+                            local_db_manager.update_document_sync_time(file_id, sync_start_time_str, file_url)
+
+                    except drive_api.DownloadPermissionsError as perm_error: # Catch specific error from api_utils
+                         print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Permission Error: {perm_error}{RESET} ")
+                         logging.warning(f"Permission error for {file_name} ({file_id}): {perm_error}")
+                         errors_encountered += 1
+                    except drive_api.DownloadAbuseError as abuse_error: # Catch specific error from api_utils
+                         print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Download Blocked (Policy): {abuse_error}{RESET} ")
+                         logging.warning(f"Download blocked for {file_name} ({file_id}): {abuse_error}")
+                         errors_encountered += 1
+                    except Exception as process_error:
+                         print(f"\r  ↳ {YELLOW}{file_name}{RESET} - {RED}Processing Error: {process_error}{RESET}    ")
+                         logging.error(f"Error processing {file_name} ({file_id}): {process_error}", exc_info=True)
+                         errors_encountered += 1
+                else:
+                    # File exists and modifiedTime is not newer
+                    print(f"{DARK_GRAY}No changes detected. Updating sync time.{RESET}")
+                    # Update lastSynced time in local DB
+                    local_db_manager.update_document_sync_time(file_id, sync_start_time_str, file_url)
+
+
+            # --- End of file loop for the page ---
+            if not page_token:
+                break # Exit pagination loop for this folder
+
+        # --- End of pagination loop for the folder ---
+        time.sleep(0.1) # Small delay between folders
+
+    # --- End of Folder Loop ---
+    print("\nFinished scanning folders.")
+
+    # --- Handle Deleted Files ---
+    if scan_entire_scope: # Only check for deletions if a full scan was performed (or target was root/drive)
+        logging.info("Performing deletion check...")
+        print("Checking for deleted or moved files...")
+        existing_ids = local_db_manager.get_all_document_ids()
+        deleted_file_ids = existing_ids - active_file_ids
+
+        if deleted_file_ids:
+            print(f"Found {len(deleted_file_ids)} potentially deleted/moved files.")
+            for file_id in deleted_file_ids:
+                doc_info = local_db_manager.get_document_info(file_id)
+                # Check if it exists and is NOT already marked as deleted
+                if doc_info and not doc_info.get("deleted", False):
+                    file_name = doc_info.get("name", "Unknown Name")
+                    print(f"  Marking deleted: {YELLOW}{file_name}{RESET} ({file_id})")
+                    logging.info(f"Marking file as deleted: {file_name} ({file_id})")
+
+                    # Mark deleted in local DB
+                    local_db_manager.mark_deleted(file_id, sync_start_time_str)
+
+                    # Delete from Vector Store
+                    delete_success = marqo_manager.delete_document(file_id)
+                    if not delete_success:
+                         print(f"  {RED}Failed to delete {file_name} from vector store.{RESET}")
+                         logging.error(f"Failed to delete file {file_id} from vector store.")
+                         errors_encountered += 1
+                    else:
+                         logging.info(f"Deleted chunks for file {file_id} from vector store.")
+
+                    files_deleted_count += 1
+        else:
+             print("No deleted files detected in the scanned scope.")
+    else:
+        logging.info(f"Target ID ({target_id}) was specified for a folder. Skipping deletion check.")
+        print(f"{DARK_GRAY}Targeted folder scan finished. Skipping deletion check outside this scope.{RESET}")
+
+
+    # --- Finalize ---
+    logging.info(f"Sync process finished. Updating database and saving state.")
+    print("Finalizing sync...")
+
+    # Update metadata and save local DB
+    local_db_manager.set_last_updated_time(sync_start_time_str)
+    local_db_manager.save() # This now also updates counts internally
+
+    # Save the timestamp for the next run
+    local_db_manager.save_last_sync_time(sync_start_time_str)
+
+    sync_end_time = time.time()
+    duration = sync_end_time - sync_start_time
+
+    # --- Reporting (Optional: Generate merged file and print stats) ---
+    if output_folder_path and output_folder_name:
+         print(f"Generating merged output file(s) in '{output_folder_path}'...")
+         # Pass the necessary data from the db manager
+         generate_success = merged_file.generate_merged_file(
+             doc_db=local_db_manager.db, # Pass the internal dict
+             timestamp=sync_start_time_str, # Use the sync time
+             files_updated=files_updated_count,
+             files_deleted=files_deleted_count,
+             output_folder_path=output_folder_path,
+             output_folder_name=output_folder_name,
+             total_download_bandwidth=total_download_bandwidth,
+             # Pass START_TIME_STRING if that specific one is needed for the report header
+             # start_time_string_for_report=START_TIME_STRING
+         )
+         if not generate_success:
+              errors_encountered +=1
+
+    # Prepare statistics for return and potential printing right now its in merged_file.py, which sucks.
+    final_stats = {
+        "start_time": sync_start_time_str,
+        "end_time": time_utils.get_current_utc_iso_string(),
+        "duration_seconds": duration,
+        "files_processed": files_processed_count,
+        "files_updated": files_updated_count,
+        "files_deleted": files_deleted_count,
+        "total_download_mb": total_download_bandwidth / (1024 * 1024),
+        "errors": errors_encountered,
+        "active_docs_in_db": local_db_manager.db.get("metadata", {}).get("active_documents", 0),
+        "total_docs_in_db": local_db_manager.db.get("metadata", {}).get("total_documents", 0),
+    }
+
+    logging.info(f"Sync completed. Stats: {final_stats}")
+    print("\nSynchronization Complete.")
+
+    return final_stats

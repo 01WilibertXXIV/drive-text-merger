@@ -114,11 +114,12 @@ def upsert_document_marqo(
         for doc in marqo_docs:
             try:
                 add_response = vector_store_client.index(index_name).add_documents(
-                    documents=[doc],
+                    documents=[doc], tensor_fields=["chunk_text"]
                 )
-                print(f"Successfully added document {doc['_id']}")
+                logging.info(f"Successfully added document {doc['_id']}")
             except Exception as e:
-                print(f"Error adding document {doc['_id']}: {e}")
+                #print(f"Error adding document {doc['_id']}: {e}")
+                logging.error(f"Error adding document {doc['_id']}: {e}", exc_info=True)
     
 
     except Exception as e:

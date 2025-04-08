@@ -2,9 +2,10 @@ from constants.colors import GREEN, RESET, YELLOW, DARK_GRAY
 from constants.app_data import APP_NAME
 import os
 import logging
-import subprocess
 
-def print_outro(output_folder_path, file_sizes, file_word_counts, total_size, total_word_count, hours, minutes, seconds, download_bandwidth, files_updated, files_deleted):
+def print_sync_summary(output_folder_path, file_sizes, file_word_counts, total_size, total_word_count, hours, minutes, seconds, download_bandwidth, files_updated, files_deleted):
+
+    
 
     """
     Print the outro message

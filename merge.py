@@ -9,12 +9,17 @@ from helpers.updater import is_update_available, update_application, restart_app
 from helpers.drive_utils import get_name_for_id, parse_drive_url
 from helpers.auth_utils import get_drive_service
 from helpers.sync_utils import get_last_sync_time
-from helpers.documents_utils import load_document_database, process_documents
+from helpers.documents_utils import process_drive_documents as process_documents
 from helpers.messages.intro import print_intro
 
 from constants.colors import RED, RESET, YELLOW, BOLD_CYAN, DARK_GRAY
 from constants.app_data import DATA_FOLDER, SYNCED_CONTENT_FOLDER
+from utils.logging_config import setup_logging
 
+from config import MARQO_URL
+
+from src.storage.local_db import LocalDBManager
+from src.storage.vector_store import MarqoManager
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -30,6 +35,10 @@ def main():
     or through interactive input.
     """
     try:
+
+        # Set up logging
+        setup_logging()
+
         # Get the Drive service
         service = get_drive_service()
 
@@ -91,14 +100,15 @@ def main():
             # Get the last sync time
             last_sync_time = get_last_sync_time(output_folder_path)
             
-            # Load the document database
-            doc_db = load_document_database(output_folder_path)
+            # Initialize local database manager
+            local_db = LocalDBManager(output_folder_path)
             
-            # Process documents and update the database
-            doc_db = process_documents(service, last_sync_time, doc_db, 
-                                     target_id, target_type, 
-                                     output_folder_path=output_folder_path, 
-                                     output_folder_name=output_folder_name)
+            # Initialize Marqo manager with an index name based on the target id (drive id)
+            print(f"Initializing Marqo manager with index name: {target_id}")
+            marqo_manager = MarqoManager(MARQO_URL, target_id)
+
+            process_documents(service, local_db, marqo_manager, output_folder_path, output_folder_name, target_id, target_type)
+
 
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Process interrupted by user. Exiting...{RESET}")
